@@ -513,6 +513,21 @@ git push origin v2.8.1
 
 版本号解析优先级：**手动输入的 `version` > tag 名（去掉 `v`）> `manifest` 里的值**。所以打 tag 时请让 tag 与 `manifest` 一致，否则源码里的版本号会落后于产物，下次手动构建容易退版本。
 
+> ⚠️ **fork 出来的仓库，推 tag 不会触发构建。** GitHub 默认不在 fork 上运行工作流（Actions 页顶部会提示 "Workflows aren't being run on this repository"）。表现是：`git push origin v2.8.0` 成功、`git ls-remote --tags` 也能看到 tag，但 Actions 运行记录里一条都没有、`total_count` 为 0，而 `workflow_dispatch`（方式 B）却照样能跑。二选一：
+>
+> 1. 打开 `https://github.com/<owner>/<repo>/actions`，点 **I understand my workflows, go ahead and enable them**，之后 tag 推送恢复正常；
+> 2. 直接用方式 B 手动触发，或走 API（注意 `inputs` 为空对象也必须带上，否则返回 422）：
+>
+> ```bash
+> curl -X POST \
+>   -H "Authorization: Bearer $GITHUB_TOKEN" \
+>   -H "Accept: application/vnd.github+json" \
+>   https://api.github.com/repos/<owner>/<repo>/actions/workflows/build-release.yml/dispatches \
+>   -d '{"ref":"main","inputs":{"version":"2.8.0"}}'
+> ```
+>
+> 用 API 触发时请让 `version` 与 tag 保持一致。另外若 tag 已经指向 HEAD，`changes` 作业的 `git diff` 为空，Release 正文的「变更详情」会是空白，需要手工补写。
+
 ### 3. 方式 B：手动触发（不打 tag 也出包）
 
 GitHub 仓库页 → **Actions** → 左侧 **Build FPK** → **Run workflow**：

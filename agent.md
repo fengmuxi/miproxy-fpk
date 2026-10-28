@@ -180,7 +180,7 @@ miproxy-fpk/
 ## 9. 已知坑与待办（改动前请留意）
 
 1. **大小写冲突（已存在）**：`app/ui/images/` 同时有 `ICON_256.PNG` 与 `icon_256.png`，在 Windows（大小写不敏感）检出会互相覆盖，导致 `git status` 显示 `ICON_256.PNG` 为已修改。**不要在 Windows 上提交这个“修改”**，更不要在大小写文件系统上误删其一；根治需在源头把文件名统一。
-2. **版本字符串漂移**：`wizard/config` 的“关于”步骤仍写 `v2.6.38`，但 `manifest` 已是 `2.7.0`；`install_callback` 头部注释写 “v11”，函数内日志却写 “v9”。改动时以 `manifest` 的 `version` 为准，并顺手同步这些文案。
+2. **版本字符串漂移**：`wizard/config` 的“关于”步骤已同步到 `v2.8.0`，但 `cmd/install_callback` 头部注释仍写 “sync v2.6.38”（脚本内部的 v9/v11 是自身迭代标记，不是产品版本，别混改）。改动时以 `manifest` 的 `version` 为准，并顺手同步这些文案。
 3. **README 引用了 `LICENSE`**，但仓库根目录实际**没有 LICENSE 文件**——若需合规发布应补上。
 4. **强依赖 `python3`**：`extract_yaml_block` 用 python3 解析订阅 YAML。fnOS 环境须自带 python3，否则安装会静默失败（heredoc 带 `2>/dev/null`）。
 5. **root 权限**：`config/privilege` 声明 `run-as: root`，TUN 必需；改权限相关要确认目标环境。
@@ -198,6 +198,9 @@ miproxy-fpk/
 17. **`settings.conf` 的读取必须同时裁掉 `\r` 和 `\n`**（`tr -d '\r\n'`）：只删 `\n` 时，CRLF 行尾会让 `sub_type` 变成 `remote\r`，比较失败，表现为「设了远程订阅却不刷新」。
 18. **`refresh_sub` 的三个自我保护**：锁文件要写 PID 并支持残留清理（`lock_is_stale`，否则一次异常退出会让自动刷新**永久**跳过）；`get_interval_seconds` 有 60 秒下限（否则 `sleep 0` 让守护进程满载空转）；`refresh_sub` 复制到数据目录后要**每次比对同步**（只在缺失时复制的话，升级 `.fpk` 后旧副本会一直生效）。
 19. **卸载链路两个红线**：`uninstall_init` 只能用 `pkill -f "${TRIM_PKGVAR}/target/mihomo"`（`pkill -f mihomo` 会误杀同机其它代理应用的进程）；`uninstall_callback` 的 `rm -rf` 必须过 `is_app_dir()`（路径含 `miproxy`）白名单，防止 `TRIM_*` 被误设成卷根目录时删空整卷。
+20. **本仓库是 fork，推 tag 不会触发构建**：`fengmuxi/miproxy-fpk` fork 自 `56025192/miproxy-fpk`。GitHub 默认不在 fork 上跑工作流，现象是 tag 推上去了、`git ls-remote --tags` 看得见，但 `GET /actions/runs` 的 `total_count` 恒为 0（父仓库同期有 169 次 push 触发的 Build FPK，可作对照），而 `workflow_dispatch` 仍然能跑。发布要么先去 Actions 页点 "I understand my workflows, go ahead and enable them"，要么用 `POST /actions/workflows/build-release.yml/dispatches` 手动触发（`inputs` 必须是对象，空也要给 `{}`）。
+21. **用 API 触发时若 tag 已指向 HEAD，Release 正文是空的**：`changes` 作业用 `git describe --tags --abbrev=0` 取上一个 tag，正好取到刚推的这个 tag，`git diff` 为空 → 「变更详情」只剩两行表头。要么先触发后打 tag，要么事后 `PATCH /releases/{id}` 把正文补上。
+22. **本机 `~/.gitconfig` 里有一行空的 `credential.helper=`**，它会把系统级的 `manager` 清空，导致所有 `git push` 报 `could not read Username for 'https://github.com': terminal prompts disabled`（明明 Windows 凭据管理器里就有 `git:https://github.com`）。不要改用户的全局配置，用命令级覆盖：`git -c credential.helper=manager push ...`；需要 token 调 API 时同理 `git -c credential.helper=manager credential fill`。
 
 ---
 
