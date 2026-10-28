@@ -1187,7 +1187,7 @@
   }
 
   // ---------------------------------------------------------------- 节点列表与测速
-  var nodeState = { items: [], testing: false, kernelRunning: false };
+  var nodeState = { items: [], testing: false, kernelRunning: false, kernelNodes: null, configNodes: 0 };
 
   function delayClass(ms) {
     if (ms === null || ms === undefined) return "na";
@@ -1243,6 +1243,9 @@
       '<div class="chip">已测 <b>' + tested + '</b></div>' +
       '<div class="chip">可用 <b>' + alive + '</b></div>' +
       '<div class="chip">平均 <b>' + (alive ? Math.round(sum / alive) + " ms" : "—") + '</b></div>';
+    if (nodeState.kernelNodes !== null && nodeState.kernelNodes !== undefined) {
+      chips += '<div class="chip">内核已加载 <b>' + nodeState.kernelNodes + '</b></div>';
+    }
     if (!nodeState.kernelRunning) chips += '<div class="chip">内核未运行，无法实测</div>';
     $("nodeStats").innerHTML = chips;
   }
@@ -1251,12 +1254,23 @@
     return api("/api/nodes").then(function (r) {
       nodeState.items = (r && r.nodes) || [];
       nodeState.kernelRunning = !!(r && r.kernel_running);
+      nodeState.kernelNodes = (r && typeof r.kernel_nodes === "number") ? r.kernel_nodes : null;
+      nodeState.configNodes = (r && typeof r.config_nodes === "number") ? r.config_nodes : nodeState.items.length;
       $("nodeSubTag").textContent = (r && r.subscription) ? "· " + r.subscription : "";
-      $("nodeHint").textContent = nodeState.items.length
-        ? "节点清单取自 config.yaml（实际生效的那份），延迟由内核真实发请求测得，测试地址 " + (r.test_url || "") + "。"
-        : "当前 config.yaml 里没有节点。请先在「订阅」页启用一个订阅并应用；若订阅显示已启用却仍然没有节点，"
+      var total = nodeState.items.length;
+      var kernel = nodeState.kernelNodes;
+      if (total) {
+        var msg = "节点清单取自 config.yaml（实际生效的那份），共 " + total + " 个；"
+          + "内核已加载 " + (kernel === null ? "—" : kernel) + " 个。延迟由内核真实发请求测得，测试地址 " + (r.test_url || "") + "。";
+        if (kernel !== null && kernel === 0 && nodeState.kernelRunning) {
+          msg += " 内核在跑但一个节点都没加载 —— 请到「内核」页重启内核，或在「订阅」页重新应用配置。";
+        }
+        $("nodeHint").textContent = msg;
+      } else {
+        $("nodeHint").textContent = "当前 config.yaml 里没有节点。请先在「订阅」页启用一个订阅并应用；若订阅显示已启用却仍然没有节点，"
           + "多半是订阅链接返回的不是 Clash/mihomo 格式（常见是 base64 编码的 v2ray 链接），"
           + "详情见「订阅」页保存时的错误提示与日志。";
+      }
       renderNodes();
     }).catch(function (e) {
       if (e.message.indexOf("未授权") < 0) toast("读取节点失败：" + e.message, "err");

@@ -632,6 +632,20 @@ NODE_TEST_URL_DEFAULT = "http://www.gstatic.com/generate_204"
 NODE_TEST_TIMEOUT_MS = 4000
 MAX_NODE_TESTS = 300
 BUILTIN_PROXIES = {"DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL"}
+# mihomo 的 /proxies 里既有真正的节点，也有策略组和内置出口。
+# 只有前两者之外的才是「节点」，统计时必须剔除，否则数字会虚高。
+PROXY_GROUP_TYPES = {"selector", "urltest", "fallback", "loadbalance", "relay", "smart"}
+BUILTIN_PROXY_TYPES = {"direct", "reject", "rejectdrop", "pass", "compatible"}
+
+
+def _is_real_proxy(name, item):
+    """内核 /proxies 里的一个条目是不是真正的节点（而非策略组或内置出口）。"""
+    if name in BUILTIN_PROXIES:
+        return False
+    kind = str((item or {}).get("type") or "").strip().lower()
+    if kind in BUILTIN_PROXY_TYPES or kind in PROXY_GROUP_TYPES:
+        return False
+    return True
 
 
 def _api_port():
@@ -746,7 +760,11 @@ def parse_config_proxies():
                 in_block = True
             continue
         # 行首顶格的键意味着 proxies 段结束（rules: / proxy-groups: ...）
-        if raw and not raw[0].isspace():
+        # ⚠️ 但顶格的 "- xxx" 是列表项、不是段结束 —— YAML 允许序列与父键同缩进，
+        #    机场订阅（subconverter 之类转换出来的）大量用这种写法。
+        #    早前这里一见顶格就 break：订阅解析出 80 多个节点、内核也正常加载，
+        #    管理界面却一个节点都显示不出来（订阅明明是好的，看着却像没生效）。
+        if raw and not raw[0].isspace() and not raw.startswith("-"):
             break
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -761,9 +779,8 @@ def parse_config_proxies():
             elif ":" in body:
                 key, val = body.split(":", 1)
                 cur[key.strip()] = _yaml_scalar(val)
-            else:
-                # 「- 」单独一行、字段全在下一层缩进里
-                cur = {}
+            # 「- 」单独一行、字段全在下一层缩进里：cur 已经是 nodes 里的那个对象，
+            # 不要再重新赋值（否则后续字段写进了一个游离的字典，节点会变成空壳）。
         elif cur is not None and ":" in line:
             key, val = line.split(":", 1)
             key = key.strip()
@@ -793,11 +810,14 @@ def build_nodes():
     kernel_alive = pid_alive(read_pid(MIHOMO_PID_FILE))
 
     live = {}
+    kernel_nodes = 0
     if kernel_alive:
         data = _mihomo_api("/proxies")
         for name, item in ((data or {}).get("proxies") or {}).items():
             if not isinstance(item, dict):
                 continue
+            if _is_real_proxy(name, item):
+                kernel_nodes += 1
             delay = None
             hist = item.get("history")
             if isinstance(hist, list) and hist:
@@ -829,6 +849,12 @@ def build_nodes():
         "subscription": sub_name,
         "sub_type": sub.get("current", {}).get("type", "none"),
         "total": len(nodes),
+        # config_nodes：config.yaml 里真实写进去的节点数
+        # kernel_nodes：内核实际加载的节点数
+        # 两个数不一致就说明「配置写了但内核没吃进去」，管理界面据此给出准确提示，
+        # 而不是笼统地说一句「没有节点」。
+        "config_nodes": len(nodes),
+        "kernel_nodes": kernel_nodes,
         "nodes": nodes,
         "test_url": NODE_TEST_URL_DEFAULT,
     }

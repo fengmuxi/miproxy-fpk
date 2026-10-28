@@ -11,6 +11,8 @@ VAR_DIR="${TRIM_PKGVAR}"
 TARGET_DIR="${VAR_DIR}/target"
 UI_TARGET="${VAR_DIR}/ui"
 CONFIG_FILE="${VAR_DIR}/config.yaml"
+# 生成中的临时文件：校验通过后才落位到 CONFIG_FILE
+CONFIG_TMP="${CONFIG_FILE}.new"
 LOG_FILE="${VAR_DIR}/info.log"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,6 +36,107 @@ TUN_ENABLE="${wizard_tun_enable:-false}"
 log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"
 }
+
+# YAML 块提取（v7 原始逻辑 + 缩进规范化）
+# ⚠️ 与 cmd/config_callback 里的同名函数保持一致（历史 bug 多源于「只修了一份」）。
+extract_yaml_block() {
+    # 解析失败不再静默丢弃：stderr 统一写入 info.log（python3 缺失/文件不可读/语法错误均可追溯）
+    python3 - "$1" "$2" 2>>"${LOG_FILE:-/dev/null}" <<'PYEOF'
+import sys
+key = sys.argv[1] + ":"
+try:
+    with open(sys.argv[2], 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+except Exception as e:
+    sys.stderr.write("[extract_yaml_block] 读取订阅缓存失败: %s (%s: %s)\n" % (sys.argv[2], type(e).__name__, e))
+    sys.exit(3)
+result = []
+found = False
+for line in lines:
+    stripped = line.rstrip('\n')
+    if not stripped.strip():
+        if found: result.append(line)
+        continue
+    is_top = not stripped[0].isspace()
+    if is_top:
+        if stripped.startswith(key):
+            found = True
+            result.append(line)
+        elif found:
+            if stripped.startswith('-'):
+                result.append(line)
+            else:
+                break
+    elif found:
+        result.append(line)
+
+
+def normalize(block):
+    """把「顶格 - 」的列表项缩进到父键下面，输出规范的 YAML 块。
+
+    为什么必须做：YAML 允许序列与父键同缩进，所以
+        proxies:
+        - name: A
+    对内核是合法的（节点能正常加载），但一堆简易解析器
+    （包括本项目早期版本的管理服务）是按「块内必须缩进」来切段的，
+    遇到顶格就认为 proxies 段结束 —— 于是订阅明明有 80 多个节点，
+    管理界面却显示 0 个，用户完全看不出问题在哪。
+    统一缩进成规范写法，两边就都对了。
+    """
+    if len(block) <= 1:
+        return block
+    body = block[1:]
+    min_indent = None
+    for l in body:
+        if not l.strip():
+            continue
+        indent = len(l) - len(l.lstrip(' '))
+        if min_indent is None or indent < min_indent:
+            min_indent = indent
+    if min_indent is None or min_indent > 0:
+        return block          # 本来就是缩进好的，不用动
+    out = [block[0]]
+    for l in body:
+        out.append(('  ' + l) if l.strip() else l.rstrip('\n'))
+    return out
+
+
+sys.stdout.write(''.join(normalize(result)))
+PYEOF
+}
+
+# 统计一个 YAML 文件里 proxies 段的条目数（顶格/缩进两种写法都认）
+count_yaml_nodes() {
+    python3 - "$1" 2>>"${LOG_FILE:-/dev/null}" <<'PYEOF'
+import sys
+path = sys.argv[1]
+try:
+    lines = open(path, encoding='utf-8', errors='replace').read().splitlines()
+except Exception:
+    print("0")
+    sys.exit(0)
+inblk = False
+count = 0
+for raw in lines:
+    if not inblk:
+        if raw.strip() == "proxies:":
+            inblk = True
+        continue
+    if raw and not raw[0].isspace():
+        if raw.startswith("-"):
+            count += 1
+        else:
+            break
+        continue
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    if line.startswith("-"):
+        count += 1
+print(count)
+PYEOF
+}
+
 
 log_msg "install_callback v11 启动"
 log_msg "  HTTP_PORT=${HTTP_PORT}, API_PORT=${API_PORT}"
@@ -113,40 +216,19 @@ fi
 
 [ "${SUB_TYPE}" = "local" ] && [ -n "${SUB_PATH}" ] && [ -f "${SUB_PATH}" ] && cp -f "${SUB_PATH}" "${SUB_CACHE_PATH}"
 
-# YAML 块提取（v7 原始逻辑，保留订阅源格式）
-extract_yaml_block() {
-    # 解析失败不再静默丢弃：stderr 统一写入 info.log（python3 缺失/文件不可读/语法错误均可追溯）
-    python3 - "$1" "$2" 2>>"${LOG_FILE:-/dev/null}" <<'PYEOF'
-import sys
-key = sys.argv[1] + ":"
-try:
-    with open(sys.argv[2], 'r', encoding='utf-8') as f:
-        lines = f.readlines()
-except Exception as e:
-    sys.stderr.write("[extract_yaml_block] 读取订阅缓存失败: %s (%s: %s)\n" % (sys.argv[2], type(e).__name__, e))
-    sys.exit(3)
-result = []
-found = False
-for line in lines:
-    stripped = line.rstrip('\n')
-    if not stripped.strip():
-        if found: result.append(line)
-        continue
-    is_top = not stripped[0].isspace()
-    if is_top:
-        if stripped.startswith(key):
-            found = True
-            result.append(line)
-        elif found:
-            if stripped.startswith('-'):
-                result.append(line)
-            else:
-                break
-    elif found:
-        result.append(line)
-sys.stdout.write(''.join(result))
-PYEOF
-}
+# 订阅缓存体检：文件多大、开头长什么样、proxies 里到底几条，一并写进日志。
+# 与 cmd/config_callback 保持一致（两份脚本的日志要能互相印证）。
+if [ -f "${SUB_CACHE_PATH}" ]; then
+    CACHE_SIZE=$(stat -c%s "${SUB_CACHE_PATH}" 2>/dev/null || wc -c < "${SUB_CACHE_PATH}")
+    CACHE_HEAD=$(head -c 100 "${SUB_CACHE_PATH}" 2>/dev/null | tr -d '\r\n' | cut -c1-100)
+    CACHE_NODES=$(count_yaml_nodes "${SUB_CACHE_PATH}")
+    log_msg "  📄 订阅缓存: ${CACHE_SIZE} bytes / proxies 条目 ${CACHE_NODES} 个"
+    log_msg "      开头: ${CACHE_HEAD}"
+fi
+# 订阅里的内联节点数（proxy-providers 型订阅是 0，那是正常的：
+# 它的节点由 provider 在运行时拉取，config.yaml 里本来就不该有内联节点）
+SUB_INLINE_NODES="${CACHE_NODES:-0}"
+
 
 # ============ v9: 完整字段同步 ============
 SUB_PROXIES=""; SUB_HOSTS=""; SUB_PG=""; SUB_RULES=""; SUB_DNS=""
@@ -194,6 +276,18 @@ if [ -f "${SUB_CACHE_PATH}" ] && [ "${HAVE_PY3}" = "1" ] && { [ "${SUB_TYPE}" = 
     log_msg "      rule-providers:$(printf '%s' "${SUB_RULE_PROVIDERS}" | wc -l)行"
     
     [ -n "${SUB_DNS}" ] && ! printf '%s' "${SUB_DNS}" | grep -q "nameserver" && SUB_DNS="" && log_msg "  ⚠️ dns 缺 nameserver，回退本地默认"
+fi
+
+# 订阅启用了却一个节点都没解析出来 —— 生成配置前先记下来，
+# 落位时据此决定「保留旧配置」还是「写入并告警」（见下方 CONFIG_TMP 处理）。
+SUB_HAS_NODES=1
+if [ "${SUB_TYPE}" = "remote" ] || [ "${SUB_TYPE}" = "local" ]; then
+    SUB_PROXY_LINES=$(printf '%s' "${SUB_PROXIES}" | wc -l | tr -d ' ')
+    SUB_PROVIDER_LINES=$(printf '%s' "${SUB_PROXY_PROVIDERS}" | wc -l | tr -d ' ')
+    if [ "${SUB_PROXY_LINES:-0}" -eq 0 ] && [ "${SUB_PROVIDER_LINES:-0}" -eq 0 ]; then
+        SUB_HAS_NODES=0
+        log_msg "  ❌ 订阅未解析出任何节点（详见上方订阅缓存体检信息）"
+    fi
 fi
 
 log_msg "生成 config.yaml..."
@@ -283,10 +377,29 @@ log_msg "生成 config.yaml..."
     [ -n "${SUB_SNIFF}" ] && echo "# sniff 嗅探" && echo "${SUB_SNIFF}"
     [ -n "${SUB_NTP}" ] && echo "# ntp 时间同步" && echo "${SUB_NTP}"
     [ -n "${SUB_SCRIPT}" ] && echo "# script 脚本" && echo "${SUB_SCRIPT}"
-} > "${CONFIG_FILE}"
+} > "${CONFIG_TMP}"
 
+# ⚠️ 先写临时文件、回读校验节点数，再落位：
+# 「卸载保留数据 → 重新安装」时数据目录里可能还留着上一份能用的 config.yaml，
+# 绝不能被一份 0 节点的配置盖掉（内核一起就没节点可用了）。
+# ⚠️ 判定条件是「订阅里本来就有内联节点、生成结果却一个都没有」——
+#    proxy-providers 型订阅本来就没有内联节点（节点由 provider 运行时拉取），
+#    不能被当成失败。
+CONFIG_NODE_COUNT=$(count_yaml_nodes "${CONFIG_TMP}")
+if [ "${SUB_INLINE_NODES:-0}" -gt 0 ] 2>/dev/null && [ "${CONFIG_NODE_COUNT:-0}" -eq 0 ] 2>/dev/null; then
+    if [ -f "${CONFIG_FILE}" ] && [ "$(count_yaml_nodes "${CONFIG_FILE}")" -gt 0 ] 2>/dev/null; then
+        rm -f "${CONFIG_TMP}"
+        log_msg "  ❌ 新生成的 config.yaml 里一个节点都没有 → 保留原有配置（其中仍有可用节点）"
+        log_msg "  ⚠️ 订阅未生效，请在管理界面「订阅」页重新应用配置"
+    else
+        mv -f "${CONFIG_TMP}" "${CONFIG_FILE}"
+        log_msg "  ⚠️ 订阅未解析出任何节点，生成的 config.yaml 里没有节点"
+    fi
+else
+    mv -f "${CONFIG_TMP}" "${CONFIG_FILE}"
+fi
 chmod 666 "${CONFIG_FILE}"
-log_msg "✅ config.yaml 已生成"
+log_msg "✅ config.yaml 已生成（内联节点 ${CONFIG_NODE_COUNT:-0} 个）"
 
 rm -f "${VAR_DIR}/base.yaml" "${VAR_DIR}/subscription.yaml" "${VAR_DIR}/subscription.conf"
 

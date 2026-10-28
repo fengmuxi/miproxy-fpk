@@ -239,7 +239,8 @@ miproxy-fpk/
 │   ├── upgrade_init  / upgrade_callback    # 升级前 / 后
 │   └── uninstall_init / uninstall_callback # 卸载前 / 后
 ├── scripts/
-│   └── dev-local.sh             # 本地开发辅助（造开发目录 / 起管理服务 / 同步前端），不进安装包
+│   ├── dev-local.sh             # 本地开发辅助（造开发目录 / 起管理服务 / 同步前端），不进安装包
+│   └── selftest_nodes.py        # 订阅节点链路自检（订阅 → config.yaml → 管理端解析），不进安装包
 ├── config/
 │   ├── privilege                # 权限声明（run-as: root，TUN 必需）
 │   └── resource                 # 数据共享声明
@@ -319,7 +320,7 @@ TUN 需 root（已声明），网卡名固定 `miproxy`；检查 `config.yaml` �
 
 按这三条依次看：
 
-1. **一个节点都没有** → `config.yaml` 里确实没有 `proxies`。最常见的原因是**订阅返回的不是 Clash YAML**（常见是 base64 编码的 v2ray 链接）——这种情况下「订阅」页保存时会直接告诉你原因，例如「订阅返回的是 base64 编码内容，需先转换成 Clash/mihomo 格式」，并且原配置会被保留。其次是订阅只保存了没点应用，配置不会重生成。
+1. **一个节点都没有** → `config.yaml` 里确实没有 `proxies`。最常见的原因是**订阅返回的不是 Clash YAML**（常见是 base64 编码的 v2ray 链接）——这种情况下「订阅」页保存时会直接告诉你原因，例如「订阅返回的是 base64 编码内容，需先转换成 Clash/mihomo 格式」，并且原配置会被保留。其次是订阅只保存了没点应用，配置不会重生成。**v2.8.5 起**节点页还会直接告诉你「配置里有几个 / 内核加载了几个」，两者不一致就是内核没吃进新配置，去「内核」页重启即可。
 2. **有节点但全部「超时」** → 先看「概览」页内核是否在运行（未运行会直接提示无法测速）；内核正常则多为节点本身失联，或 NAS 出网被拦（测速走的是内核自己的代理链路，不是管理服务的网络）。
 3. **全部显示 `unauthorized`** → 管理页访问内核控制端口的密钥与 `config.yaml` 里的 `secret` 不一致。当前版本已改为直接读 `config.yaml` 的 `secret`，通常不会再出现；若仍是，检查 `config.yaml` 是否被手工改过 `secret` 而后台服务又在读另一份。
 
@@ -381,6 +382,14 @@ bash scripts/dev-local.sh admin     # 前台起管理界面：http://127.0.0.1:9
 ```bash
 wizard_sub_type=remote wizard_sub_url="https://example.com/clash.yaml" bash scripts/dev-local.sh init
 ```
+
+**订阅节点链路自检**（改了订阅解析 / `config.yaml` 生成 / 节点页就跑一遍）：
+
+```bash
+python3 scripts/selftest_nodes.py
+```
+
+覆盖顶格 `-`、标准缩进、单行 flow 三种订阅写法，以及「订阅里没有节点」「订阅返回 base64」两种失败场景，断言的是「订阅里几条 → `config.yaml` 里几条 → 管理端解析出几条」三者一致，且失败时旧配置不被覆盖。Windows 上若 `bash` 指向 WSL 启动器会被安全策略拦掉，脚本会自动挑 Git Bash，也可用 `MIPROXY_TEST_BASH` 指定路径。
 
 > **能跑到什么程度**：bash 回调、配置生成与校验、管理界面（含订阅管理、日志、内核页）全都能本地跑通；**只有 mihomo 内核本身跑不起来**——它是 Linux ELF 二进制，Windows 上无法执行（`/api/status` 会显示 `running: false`，内核版本读不到，属预期）。要验证真实代理 / TUN，得在 WSL、Linux 或 NAS 上跑。
 
@@ -630,6 +639,11 @@ changes ──┬─→ build-x86 ──┐
 ---
 
 ## 更新日志
+
+### v2.8.5
+- 🐛 修复（重要）：**订阅明明下载成功、节点却一个都显示不出来**。机场订阅（subconverter 之类转换出来的）大量使用「顶格 `-`」写法——YAML 允许序列与父键同缩进，所以这种写法对内核是合法的、节点能正常加载，但管理服务是按「块内必须缩进」切段的，遇到顶格就认为 `proxies` 段已经结束，结果就是**配置里明明有 80 多个节点、界面却显示 0 个**，用户完全看不出问题在哪。现在：①生成 `config.yaml` 时把顶格列表项统一缩进到父键下面（输出规范 YAML）；②管理服务兼容顶格写法，**升级后不用重新应用配置也能立刻看到节点**；③`config.yaml` 写盘前先回读校验内联节点数，订阅里明明有节点却生成出 0 节点时绝不落盘、绝不覆盖正在生效的配置（`proxy-providers` 型订阅本来就没有内联节点，不受影响）
+- ✨ 节点页新增「**内核已加载 N 个**」：把「`config.yaml` 里有几个节点」和「内核实际加载了几个」分开显示，两者不一致时直接提示去重启内核——不再笼统地说一句「没有节点」
+- 🔍 订阅日志新增**体检信息**：缓存文件多大、开头长什么样、`proxies` 里到底几条，一行行写进 `info.log`；字节数与条目数对不上时一眼就能看出是哪一环出的问题
 
 ### v2.8.4
 - 🐛 修复（重要）：**下载订阅时没带 User-Agent，导致「订阅成功但节点为 0」**。绝大多数订阅服务按 UA 决定返回格式，普通客户端（curl 的默认 UA）拿回来的是 **base64 编码的 v2ray 链接**而不是 YAML。现在抓取订阅一律带 `clash.meta` UA，若拿到的内容不像 Clash YAML 会自动换一个 UA 重试一次（`cmd/sub_download.sh`，安装 / 配置变更 / 定时刷新三处统一使用）

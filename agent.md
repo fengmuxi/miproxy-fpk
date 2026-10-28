@@ -91,7 +91,7 @@ miproxy-fpk/
 `config.yaml` **完全由脚本用 `echo` 拼接生成**，不是手写文件。⚠️ 这段生成逻辑在 `install_callback` 与 `config_callback` 里**各有一份副本（尚未抽公共库）**，改一处必须同步另一处，否则会出现「安装出来的配置对、改配置后不对」（或反之）的诡异现象。关键点：
 
 1. **两份生成逻辑必须等价**：字段列表、TUN 参数、settings.conf 键、订阅解析 heredoc 三处都要对齐。改完用「同一份订阅分别跑两个脚本，再 diff 生成的 config.yaml」验证（注释行与 flow/block 风格差异可忽略，其余应一致）。
-2. **订阅解析**用一段内嵌的 `python3` heredoc `extract_yaml_block(key, file)`，按“顶层键”从订阅源 YAML 抽取整块（proxies / proxy-groups / rules / dns / proxy-providers 等十几个字段）。改动解析逻辑务必保持“保留订阅源原始格式”的约定（历史 bug 多源于此）。
+2. **订阅解析**用一段内嵌的 `python3` heredoc `extract_yaml_block(key, file)`，按“顶层键”从订阅源 YAML 抽取整块（proxies / proxy-groups / rules / dns / proxy-providers 等十几个字段）。抽取后**必须过一遍 `normalize()` 统一缩进**（见 §9.36）：订阅源常见的「顶格 `-`」写法要缩进到父键下面，输出的 `config.yaml` 才是规范 YAML。其余内容保持订阅源原始格式。
 3. **DNS 兜底**：若订阅自带 `dns:` 块但缺 `nameserver`，则丢弃改用本地默认 DNS（见 install_callback 末尾对 `SUB_DNS` 的处理）。
 4. **fake-ip-filter**：远程订阅时会用 `sed`+`grep -oE` 从 URL 提取合法域名做白名单（`SUB_DOMAIN_FILTER`），这是**防命令注入**的安全处理，不要改成直接拼接 URL。
 5. TUN 网卡名固定为 `miproxy`，`strict-route: true`、`gso: true` 是 v2.7 的防 DNS 泄露 / 性能优化项，改动需谨慎。
@@ -185,7 +185,7 @@ miproxy-fpk/
 ## 9. 已知坑与待办（改动前请留意）
 
 1. **大小写冲突（已存在）**：`app/ui/images/` 同时有 `ICON_256.PNG` 与 `icon_256.png`，在 Windows（大小写不敏感）检出会互相覆盖，导致 `git status` 显示 `ICON_256.PNG` 为已修改。**不要在 Windows 上提交这个“修改”**，更不要在大小写文件系统上误删其一；根治需在源头把文件名统一。
-2. **版本字符串漂移**：`wizard/config` 的“关于”步骤已同步到 `v2.8.4`，但 `cmd/install_callback` 头部注释仍写 “sync v2.6.38”（脚本内部的 v9/v11 是自身迭代标记，不是产品版本，别混改）。改动时以 `manifest` 的 `version` 为准，并顺手同步这些文案。
+2. **版本字符串漂移**：`wizard/config` 的“关于”步骤已同步到 `v2.8.5`，但 `cmd/install_callback` 头部注释仍写 “sync v2.6.38”（脚本内部的 v9/v11 是自身迭代标记，不是产品版本，别混改）。改动时以 `manifest` 的 `version` 为准，并顺手同步这些文案。
 3. **README 引用了 `LICENSE`**，但仓库根目录实际**没有 LICENSE 文件**——若需合规发布应补上。
 4. **强依赖 `python3`**：`extract_yaml_block` 用 python3 解析订阅 YAML。fnOS 环境须自带 python3，否则安装会静默失败（heredoc 带 `2>/dev/null`）。
 5. **root 权限**：`config/privilege` 声明 `run-as: root`，TUN 必需；改权限相关要确认目标环境。
@@ -219,6 +219,15 @@ miproxy-fpk/
 33. **下载订阅必须带 `User-Agent: clash.meta`**。绝大多数订阅服务按 UA 决定返回格式：用 curl 默认 UA（`curl/8.x`）去拿，拿回来是 **base64 编码的 v2ray 链接**而不是 YAML —— 现象是「订阅下载成功、proxies 0 行、节点一个都没有」，极易被误判成解析 bug。三处下载（`install_callback` / `config_callback` / `refresh_sub`）统一走 `cmd/sub_download.sh` 的 `download_subscription()`：带 `clash.meta` 取一次，不像 Clash YAML 就换 `ClashforWindows/0.20.39` 再取一次，仍不像就把原文件留下供诊断（返回码 2）。**新增下载入口时不要再直接写 `curl`**，否则这个坑会再踩一遍。
 34. **订阅解析出 0 个节点必须判失败**。`proxies:` 与 `proxy-providers:` 都为 0 时，config.yaml 里一条节点都没有，用户却看到「已启用」。现在 `config_callback` 会：①用 `diagnose_subscription()` 判定是 base64 / HTML / JSON / 缺段；②**旧配置里还有节点就保留旧配置并 `exit 4`**（绝不用空配置洗掉还能用的节点）；③旧配置也没节点才继续写，并仍以 `exit 4` 收尾。管理服务按返回码分流：**3 = 内核重启失败、4 = 订阅无节点**，其余按未知错误处理。
 35. **`exit 4` 的诊断要从日志里捞，别在服务端另写一套判断**：`admin_server._last_interesting_log_line()` 按关键词优先级从 `info.log` 尾部取最后一条命中行（优先取「为什么坏」的诊断行，再取「做了什么」的处置行），把脚本的原话带回接口错误信息。两处判断各写一遍必然对不上。
+36. **YAML 允许「序列与父键同缩进」，这是本项目最贵的一个坑**。机场订阅（subconverter 之类转换出来的）大量使用「顶格 `-`」写法：
+
+    ```yaml
+    proxies:
+    - name: "香港 01"
+      type: ss
+    ```
+
+    这份 YAML 对内核是**合法**的，节点能正常加载；但任何「按缩进切段」的简易解析器（管理服务的 `parse_config_proxies`、脚本里的 `config_has_nodes`）都会在**第一个顶格 `-` 处认为 `proxies` 段已经结束**，于是读出 0 个节点。现象极具迷惑性：订阅下载成功、config.yaml 重新生成成功、内核也正常跑着，**唯独管理界面一个节点都没有**，用户完全看不出问题在哪（v2.8.5 之前就是这样）。现在有三道防线：①`extract_yaml_block` 抽完块统一 `normalize()`，把顶格列表项缩进到父键下，输出规范 YAML；②`admin_server.parse_config_proxies` 兼容顶格写法（**升级后不用重新应用配置也能立刻看到节点**，因为 NAS 上已有的旧 `config.yaml` 还是顶格的）；③生成 `config.yaml` 时先写临时文件、`count_yaml_nodes()` 回读校验节点数，0 节点直接 `exit 4` 且**不覆盖正在生效的配置**。**新增任何按 YAML 缩进切段的解析代码，都必须同时认这两种写法**（判定段结束的条件是「顶格且不是 `-`」）。另：脚本里数节点条数统一用 `count_yaml_nodes()`，不要另写一份计数逻辑——两份计数必然对不上。**「生成结果 0 节点就判失败」这条只针对「订阅里本来就有内联节点」**：`proxy-providers` 型订阅的节点由 provider 在运行时拉取，`config.yaml` 里本来就没有内联节点，不能当成失败（判定用 `SUB_INLINE_NODES`，不是 `SUB_HAS_NODES`）。
 
 ---
 
