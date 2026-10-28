@@ -160,6 +160,34 @@
   .delay.na{color:#9aa0b4;font-weight:500}
   .node-table .btn.mini{padding:5px 10px;font-size:12.5px}
 
+  /* 配置应用进度遮罩：应用配置期间挡住所有操作，避免用户重复点击导致状态错乱 */
+  #applyMask{position:fixed;inset:0;z-index:120;display:none;
+             background:rgba(20,22,34,.42);backdrop-filter:blur(2px)}
+  #applyMask.show{display:flex;align-items:center;justify-content:center}
+  .apply-card{width:min(460px,calc(100vw - 40px));background:#fff;border-radius:16px;
+              box-shadow:0 18px 48px rgba(15,17,29,.28);padding:22px 24px}
+  .apply-card h3{font-size:15px;margin-bottom:4px;display:flex;align-items:center;gap:9px}
+  .apply-card .apply-sub{font-size:12.5px;color:var(--muted);margin-bottom:16px}
+  .apply-spin{width:17px;height:17px;border-radius:50%;border:2px solid #dfe2f2;border-top-color:var(--accent);
+              animation:applyspin .8s linear infinite;flex:0 0 auto}
+  @keyframes applyspin{to{transform:rotate(360deg)}}
+  .apply-bar{height:7px;border-radius:999px;background:#eceef7;overflow:hidden;margin-bottom:14px}
+  .apply-bar>i{display:block;height:100%;width:0;border-radius:999px;
+               background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .35s ease}
+  .apply-steps{list-style:none;margin:0;padding:0;font-size:13px}
+  .apply-steps li{display:flex;align-items:center;gap:9px;padding:5px 0;color:var(--muted)}
+  .apply-steps li .dot{width:16px;height:16px;border-radius:50%;border:2px solid #d6dae9;flex:0 0 auto;
+                       display:flex;align-items:center;justify-content:center;font-size:10px;color:#fff}
+  .apply-steps li.done{color:var(--text)}
+  .apply-steps li.done .dot{background:var(--ok);border-color:var(--ok)}
+  .apply-steps li.active{color:var(--accent);font-weight:600}
+  .apply-steps li.active .dot{border-color:var(--accent);border-top-color:var(--accent);
+                              animation:applyspin .8s linear infinite}
+  .apply-steps li.failed{color:var(--err);font-weight:600}
+  .apply-steps li.failed .dot{background:var(--err);border-color:var(--err)}
+  .apply-note{margin-top:14px;font-size:12px;color:var(--muted);line-height:1.6}
+  .apply-note.err{color:var(--err)}
+
   /* 内核 */
   .kgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px 18px;margin-bottom:14px}
   .kgrid .k-item{min-width:0}
@@ -490,6 +518,17 @@
 
 <div id="toast"></div>
 
+<!-- 配置应用进度遮罩：应用配置期间挡住所有操作，并显示进行到哪一步 -->
+<div id="applyMask" aria-hidden="true">
+  <div class="apply-card">
+    <h3><span class="apply-spin" id="applySpin"></span><span id="applyTitle">正在应用配置</span></h3>
+    <div class="apply-sub" id="applySub">请稍候，不要关闭页面</div>
+    <div class="apply-bar"><i id="applyBar"></i></div>
+    <ul class="apply-steps" id="applySteps"></ul>
+    <div class="apply-note" id="applyNote"></div>
+  </div>
+</div>
+
 <script>
 (function () {
   "use strict";
@@ -709,6 +748,128 @@
     if (box) box.innerHTML = '<pre class="apply-log">' + esc(log) + "</pre>";
   }
 
+  // ---------------------------------------------------------------- 配置应用进度
+  //
+  // 应用配置要跑十几秒到一分钟（下载订阅 → 解析 → 生成配置 → 重启内核）。
+  // 过去是同步等到底，页面上只有一个转圈的按钮，用户不知道进行到哪一步、
+  // 也不知道是卡住了还是只是慢。现在后端异步执行并写进度文件，这里轮询展示阶段，
+  // 同时用遮罩挡住其它操作 —— 避免用户在应用期间又点别的，把状态搅乱。
+  var APPLY_STEPS = [
+    { stage: "start",       text: "准备中" },
+    { stage: "downloading", text: "正在下载订阅信息" },
+    { stage: "parsing",     text: "正在解析订阅内容" },
+    { stage: "generating",  text: "正在生成配置文件" },
+    { stage: "saving",      text: "正在保存配置" },
+    { stage: "restarting",  text: "正在重启内核" },
+    { stage: "done",        text: "已完成" }
+  ];
+  var applyPoll = null;
+  var applyStartedAt = 0;
+
+  function applyMaskShow(title, sub) {
+    var mask = $("applyMask");
+    if (!mask) return;
+    mask.classList.add("show");
+    mask.setAttribute("aria-hidden", "false");
+    $("applyTitle").textContent = title || "正在应用配置";
+    $("applySub").textContent = sub || "请稍候，不要关闭页面";
+    $("applyBar").style.width = "0%";
+    $("applyNote").textContent = "";
+    $("applyNote").className = "apply-note";
+    applyStartedAt = Date.now();
+    renderApplySteps("start", "");
+  }
+
+  function applyMaskHide() {
+    var mask = $("applyMask");
+    if (!mask) return;
+    mask.classList.remove("show");
+    mask.setAttribute("aria-hidden", "true");
+    $("applySpin").style.display = "";
+  }
+
+  // 按当前阶段渲染步骤清单：已过的打勾、当前的转圈、没到的置灰
+  function renderApplySteps(curStage, failedStage) {
+    var ul = $("applySteps");
+    if (!ul) return;
+    var idx = -1;
+    for (var i = 0; i < APPLY_STEPS.length; i++) {
+      if (APPLY_STEPS[i].stage === curStage) { idx = i; break; }
+    }
+    var html = "";
+    for (var j = 0; j < APPLY_STEPS.length; j++) {
+      var s = APPLY_STEPS[j];
+      var cls = "", dot = "";
+      if (failedStage && s.stage === failedStage) {
+        cls = "failed"; dot = "!";
+      } else if (idx >= 0 && j < idx) {
+        cls = "done"; dot = "✓";
+      } else if (idx >= 0 && j === idx) {
+        cls = "active"; dot = "";
+      } else {
+        dot = "";
+      }
+      html += '<li class="' + cls + '"><span class="dot">' + dot + "</span><span>" + esc(s.text) + "</span></li>";
+    }
+    ul.innerHTML = html;
+  }
+
+  function applyProgressUpdate(t) {
+    if (!t) return;
+    var stage = t.stage || "";
+    var pct = (typeof t.percent === "number") ? t.percent : 0;
+    var msg = t.message || "";
+    $("applyBar").style.width = Math.max(0, Math.min(100, pct)) + "%";
+    if (msg) $("applySub").textContent = msg;
+    renderApplySteps(stage, t.state === "error" ? stage : "");
+    if (t.state === "error") {
+      $("applyTitle").textContent = "配置应用失败";
+      $("applySpin").style.display = "none";
+      var note = $("applyNote");
+      note.textContent = t.error || msg || "执行失败，请查看日志";
+      note.className = "apply-note err";
+    }
+  }
+
+  // 轮询进度直到任务结束
+  function pollApplyProgress(done) {
+    stopApplyPoll();
+    applyPoll = setInterval(function () {
+      api("/api/apply/progress").then(function (t) {
+        applyProgressUpdate(t);
+        if (t && (t.state === "done" || t.state === "error")) {
+          stopApplyPoll();
+          if (t.state === "done") {
+            $("applyTitle").textContent = "配置已应用";
+            $("applySpin").style.display = "none";
+            $("applyBar").style.width = "100%";
+          }
+          if (done) done(t);
+        }
+      }).catch(function () {
+        // 轮询失败（比如管理服务刚好在重启）不立刻放弃，等下一拍
+      });
+    }, 700);
+  }
+
+  function stopApplyPoll() {
+    if (applyPoll) { clearInterval(applyPoll); applyPoll = null; }
+  }
+
+  // 后端返回 202 = 已受理、异步执行中 → 开遮罩并开始轮询
+  function startApplyTask(r, onDone) {
+    applyMaskShow("正在应用配置", "正在准备…");
+    pollApplyProgress(onDone);
+    if (r) {
+      var p = (r.result && r.result.body) || {};
+      if (p.error) {
+        var note = $("applyNote");
+        note.textContent = p.error;
+        note.className = "apply-note err";
+      }
+    }
+  }
+
   // config_callback 的日志里有「proxies:N行」，拿它当"配置里到底有没有节点"的凭据。
   // 提取到 0 行通常意味着订阅不是 Clash 格式（base64 订阅、或下载到的是错误页）。
   // 注意取**最后一次**出现：日志是 info.log 的尾部，前面可能还留着上一次应用的统计。
@@ -734,6 +895,33 @@
       method: "POST",
       body: JSON.stringify({ items: items, active_id: activeId })
     }).then(function (r) {
+      // 202 = 后端已受理，正在后台应用配置 → 开遮罩并轮询进度
+      if (r && r.accepted) {
+        startApplyTask(r, function (t) {
+          var body = (t && t.result && t.result.body) || {};
+          if (t && t.state === "error") {
+            toast(body.error || "配置应用失败", "err");
+            if (body.log) showApplyLog(body.log);
+          } else {
+            // 启用订阅时，必须确认配置里真的抽出了节点，否则「已生效」也是空配置
+            var n = nodeLinesFromLog(body.log);
+            if (r.applied && activeId && n === 0) {
+              toast("配置已生成，但没有从订阅里提取到任何节点——请确认订阅是 Clash 格式", "err");
+              showApplyLog(body.log);
+            } else if (r.applied && activeId) {
+              toast((okMsg || "已应用") + (n ? "（节点 " + n + " 行）" : ""), "ok");
+            } else if (r.applied) {
+              toast(okMsg || "已应用", "ok");
+            } else {
+              toast(okMsg || "已保存", "ok");
+            }
+          }
+          applyMaskHide();
+          state.subBusy = false;
+          loadSubs(); loadStatus(); loadSettings();
+        });
+        return r;
+      }
       var v = applyVerdict(r);
       if (v.level === "err") {
         toast(v.text, "err");
@@ -764,6 +952,7 @@
         showApplyLog(e.body.log);
       }
       loadSubs();   // 失败也要回到服务端真相，别让页面显示假的「已启用」
+      applyMaskHide();
       throw e;
     }).finally(function () {
       state.subBusy = false;
@@ -910,6 +1099,24 @@
     var p = payload();
     api("/api/settings", { method: "POST", body: JSON.stringify(p) }).then(function (r) {
       if (p.secret) setToken(p.secret);
+      // 202 = 后端已受理，正在后台应用配置 → 开遮罩并轮询进度
+      if (r && r.accepted) {
+        startApplyTask(r, function (t) {
+          var body = (t && t.result && t.result.body) || {};
+          if (body.log) $("logView").textContent = body.log;
+          if (t && t.state === "error") {
+            toast(body.error || "配置应用失败", "err");
+          } else {
+            toast(body.mihomo_running ? "配置已保存，内核已重启" : "配置已保存；内核未运行，请查看日志",
+                  body.mihomo_running ? "ok" : "");
+          }
+          applyMaskHide();
+          btn.disabled = false;
+          btn.textContent = label;
+          loadStatus(); loadSettings(); loadSubs();
+        });
+        return;
+      }
       if (r.log) $("logView").textContent = r.log;
       var v = applyVerdict(r);
       if (v.level === "err") {
@@ -924,6 +1131,7 @@
         $("errList").innerHTML = e.body.errors.map(function (x) { return "<li>" + esc(x) + "</li>"; }).join("");
       }
       if (e.body && e.body.log) $("logView").textContent = e.body.log;
+      applyMaskHide();
     }).finally(function () {
       btn.disabled = false;
       btn.textContent = label;

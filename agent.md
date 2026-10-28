@@ -88,9 +88,9 @@ miproxy-fpk/
 
 ## 5. 配置生成逻辑（最容易改错的地方）
 
-`config.yaml` **完全由脚本用 `echo` 拼接生成**，不是手写文件。⚠️ 这段生成逻辑在 `install_callback` 与 `config_callback` 里**各有一份副本（尚未抽公共库）**，改一处必须同步另一处，否则会出现「安装出来的配置对、改配置后不对」（或反之）的诡异现象。关键点：
+`config.yaml` **完全由脚本用 `echo` 拼接生成**，不是手写文件。生成核心已统一抽到共用库 **`cmd/miproxy_config_lib.sh`**（两个 callback 在顶部 `source` 它），字段抽取（`extract_yaml_block` / `extract_subscription_fields`）、节点计数（`count_yaml_nodes`）、订阅诊断（`diagnose_subscription` / `config_has_nodes`）、域名过滤（`compute_domain_filter`）、最终生成（`emit_config_yaml`）都只有这一份实现，**不会再出现「只修了一份」的分歧**。两个 callback 只保留各自差异化流程（下载订阅 / 写 settings.conf / 重启内核 / 进度上报 / 退出码）。关键点：
 
-1. **两份生成逻辑必须等价**：字段列表、TUN 参数、settings.conf 键、订阅解析 heredoc 三处都要对齐。改完用「同一份订阅分别跑两个脚本，再 diff 生成的 config.yaml」验证（注释行与 flow/block 风格差异可忽略，其余应一致）。
+1. **生成入口唯一**：改 config.yaml 模板（字段列表、TUN 参数、DNS 兜底、fake-ip-filter 等）只改 `miproxy_config_lib.sh` 的 `emit_config_yaml`，install 与 config 两条链路自动一致。验证方式仍可用「同一份订阅分别跑两个脚本，再 diff 生成的 config.yaml」（应完全一致）。
 2. **订阅解析**用一段内嵌的 `python3` heredoc `extract_yaml_block(key, file)`，按“顶层键”从订阅源 YAML 抽取整块（proxies / proxy-groups / rules / dns / proxy-providers 等十几个字段）。抽取后**必须过一遍 `normalize()` 统一缩进**（见 §9.36）：订阅源常见的「顶格 `-`」写法要缩进到父键下面，输出的 `config.yaml` 才是规范 YAML。其余内容保持订阅源原始格式。
 3. **DNS 兜底**：若订阅自带 `dns:` 块但缺 `nameserver`，则丢弃改用本地默认 DNS（见 install_callback 末尾对 `SUB_DNS` 的处理）。
 4. **fake-ip-filter**：远程订阅时会用 `sed`+`grep -oE` 从 URL 提取合法域名做白名单（`SUB_DOMAIN_FILTER`），这是**防命令注入**的安全处理，不要改成直接拼接 URL。
@@ -110,7 +110,7 @@ miproxy-fpk/
 | 安装前 | `install_init` | 当前空（exit 0） |
 | 安装后 | `install_callback` | 拷资源 → 下订阅 → 生成 config.yaml → 写 settings.conf → 调 `main start` |
 | 配置前 | `config_init` | 当前空 |
-| 配置后 | `config_callback` | 重新生成配置并重启（**未读，改配置相关逻辑时必须先读它**） |
+| 配置后 | `config_callback` | 重新生成配置 + 用 `restart-kernel` **只重启内核**（**未读，改配置相关逻辑时必须先读它**）；重启期间写 `apply.progress` 阶段进度，并用 `RESTART_FLAG` 让 `main status` 仍返回运行，避免 fnOS 误判应用停止 |
 | 启动/停止/重启/状态 | `main` | 管理 mihomo 进程 + 刷新守护进程 + 管理服务（`admin_server.py`）；`status` 返回 fnOS 约定的退出码（运行=0，停止=3）。**即使 mihomo 启动失败也会拉起管理服务**，便于在界面里改错配置 |
 | 订阅刷新 | `refresh_sub` | 常驻守护进程，按 `wizard_refresh_interval` 小时循环；自带 `LOCK_FILE` 防并发；结束时 `trap` 清理锁与 PID 文件。**每轮都走「下载缓存 → `apply_config no-restart` 重生成 config.yaml → `restart_mihomo`」**，成功记「已应用新订阅」。带 `once` 参数时为单次「刷新并应用」（下载 → `config_callback` 重生成 → 重启内核），供管理界面「立即刷新订阅」调用 |
 | 管理服务 | `admin_server.py` | 由 `main` 拉起（`nohup`），提供 9091 的静态页 + REST API；不受 mihomo 启停影响 |
@@ -143,9 +143,10 @@ miproxy-fpk/
 | GET | `/` `/admin/` `/admin/*` | 静态页（`_serve_static`，含路径穿越防护） |
 | GET | `/api/status` | 内核/管理服务 PID 与存活、`config.yaml` 与订阅缓存大小时间、`auth_required` |
 | GET | `/api/settings` | 当前配置；**密码/密钥只返回 `proxy_pass_set` / `secret_set` 布尔值** |
-| POST | `/api/settings` | 校验 → 以 `wizard_*` 环境变量调 `config_callback` → 返回 rc、内核状态、`info.log` 尾部。请求带 `active_sub_id` 时会按清单校准 `sub_*`，防止前端旧状态覆盖订阅。**rc=3** 内核重启失败、**rc=4** 订阅没解析出节点（带诊断原文） |
+| POST | `/api/settings` | 校验 → 以 `wizard_*` 环境变量**异步**调 `config_callback`（后台线程，返回 **202**）→ 前端轮询 `/api/apply/progress` 直到 `done`/`failed`；最终返回 rc、内核状态、`info.log` 尾部。请求带 `active_sub_id` 时会按清单校准 `sub_*`，防止前端旧状态覆盖订阅。**rc=3** 内核重启失败、**rc=4** 订阅没解析出节点（带诊断原文）、**rc=5** 有其它配置应用正在进行（`apply.lock` 冲突） |
 | GET | `/api/subscriptions` | 订阅清单 + `active_id`（以 settings.conf 反查；向导里配的订阅不在清单时会合成 `legacy` 条目） |
-| POST | `/api/subscriptions` | 保存清单；**仅当启用项变化**才调 `config_callback` 重生成配置并重启（`applied` 字段告诉前端） |
+| POST | `/api/subscriptions` | 保存清单；**仅当启用项变化**才异步调 `config_callback` 重生成配置并重启（`applied` 字段 + 202 异步 + `/api/apply/progress` 轮询） |
+| GET | `/api/apply/progress` | 切换订阅 / 保存配置的阶段进度（`stage` / `percent` / `message`，UTF-8，由 `config_callback` 写入 `apply.progress`）：`downloading` → `parsing` → `generating` → `restarting` → `done` / `failed`。前端据此显示「下载订阅信息 → 解析中 → 生成配置中 → 重启内核中 → 已完成」并弹出**遮罩**阻止并发操作 |
 | GET | `/api/nodes` | 解析 `config.yaml` 的 `proxies` 得节点清单（名称/类型/server/port/udp/延迟），并合并内核 `/proxies` 的 `history[-1].delay`；`kernel_running` 告知能否实测 |
 | POST | `/api/nodes/delay` | 并发测速：`{names:[], url?, timeout?}` → `{results:{name:{delay,error}}}`。只读，**不走 `_write_blocked()`**；内核未运行返回 409 |
 | GET | `/api/logs?name=&lines=` | 日志尾部，`name` 必须在 `LOG_WHITELIST` 白名单内 |
@@ -190,7 +191,7 @@ miproxy-fpk/
 4. **强依赖 `python3`**：`extract_yaml_block` 用 python3 解析订阅 YAML。fnOS 环境须自带 python3，否则安装会静默失败（heredoc 带 `2>/dev/null`）。
 5. **root 权限**：`config/privilege` 声明 `run-as: root`，TUN 必需；改权限相关要确认目标环境。
 6. 脚本里有大量 `find_script` / 多路径兜底（如 `/var/apps/miproxy/cmd/`、`/var/packages/miproxy/cmd/`），是为了兼容不同 fnOS 安装布局——新增脚本调用尽量复用这些路径探测逻辑，不要硬编码单一路径。
-7. **`config.yaml` 生成逻辑有两份副本**（`install_callback` / `config_callback`），改动必须成对进行（见 §5）。同样 `extract_yaml_block` 也有两份，历史 bug 正是「只修了一份」导致的。
+7. **`config.yaml` 生成逻辑已统一到 `cmd/miproxy_config_lib.sh`**（v2.8.6）：`extract_yaml_block` / `count_yaml_nodes` / `diagnose_subscription` / `config_has_nodes` / `compute_domain_filter` / `extract_subscription_fields` / `emit_config_yaml` 只有这一份实现，两个 callback `source` 它调用。新增脚本要放到 `main` 的 `sync_cmd_scripts()` 列表与 CI chmod 循环里（这文件不含 shebang 执行路径，但保持列表完整便于排查）。
 8. **本地（Windows）调试 python 服务时 `bash` 可能指错**：PATH 里的 `bash` 常是 `C:\Windows\System32\bash.exe`（WSL 启动器），在安全策略下会直接被拦截并返回 rc=1，现象是「配置保存成功但 config.yaml 没更新」。`admin_server.py` 的 `bash_bin()` 会优先 `/bin/bash`，可用环境变量 `MIPROXY_BASH` 指定；临时验证也可把 Git Bash 目录放到 PATH 前面。
 9. **Windows 下 `os.kill(pid, 0)` 不是「探测存活」**，而是 TerminateProcess（会直接杀进程）。判断进程是否存活用 `tasklist`（`admin_server.pid_alive()` 已处理），bash 侧用 `kill -0`。
 10. **「未启用订阅」不能再吃旧缓存**：两个 callback 抽取订阅字段前必须判断 `SUB_TYPE` 属于 `remote`/`local`（已修）。`proxy_providers/subscription.yaml` 会一直留着上一次的缓存以便快速切回，如果不加判断，`sub_type=none` 时照样会把旧节点写进 `config.yaml`，表现为「停用了但还在走代理」。
@@ -215,7 +216,7 @@ miproxy-fpk/
 29. **并发测速要设上限**：`test_nodes()` 用 `ThreadPoolExecutor(max_workers=6)`，单个 4 秒超时，单批最多 300 个。要是不限并发，一个 500 节点的订阅点「全部测速」会瞬间打满文件描述符和内核连接数，连正常上网都受影响。单点失败只影响该节点（`results[name].error`），不能让一个超时把整批拖垮。
 30. **`__file__` 不可信：脚本可能正从「装完就会被删的临时目录」里运行**。fnOS 安装/升级的链路是 `/vol1/appcenter-downloads/<包名>`（解包临时目录）→ 执行 `install_callback` → 拉起 `main` → 拉起 `admin_server.py`。装完临时目录被系统清理，进程却还活着（代码已在内存、静态页从数据目录读），于是 `admin_server.py` 里 `os.path.dirname(__file__)` 指向了一个已消失的路径，**所有 `os.path.isfile(CMD_DIR/xxx)` 全部失败**。现象极具迷惑性：页面、状态、订阅清单都正常，一点保存就报「找不到 config_callback 脚本」，而更早的版本还会把它当成「保存成功但没生效」。现在有两道防线：①`main` 的 `sync_cmd_scripts()` 每次启动把 `main` / `admin_server.py` / `config_callback` / `refresh_sub` 按内容比对同步到 `${TRIM_PKGVAR}/cmd/`，`find_admin_script()` 优先从那里启动；②`admin_server.find_cmd_script()` 按「数据目录 → 安装目录 → `/var/apps` → `/var/packages` → `__file__`」依次探测，报错时把查过的目录全部列出。**新增任何「按脚本自身位置找兄弟脚本」的代码，都不要只写 `os.path.join(os.path.dirname(__file__), ...)`。** 判据是「这个路径现在还能用吗」；「它是不是我的邻居」并不构成理由。
 31. **不要改第三方面板的文件，要用「包装页 + iframe」承载**。Zashboard / MetaCubeXD 是上游前端产物：改 `app/ui/<panel>/index.html` 会在面板升级时被整体覆盖，把仓库搞脏；往里注入元素也会**挡住面板自己的操作元素**（面板里大量用 `position: fixed` 的顶栏/侧栏元素，注入的悬浮按钮正好压在侧栏图标上；用户已经明确要求改成顶部导航行）。现在的做法：`app/ui/frame-zashboard.html`、`app/ui/frame-metacubexd.html` 两个自包含的包装页，顶栏用 flex 固定 32px、`iframe` 撑满剩余高度（`flex:1 1 auto`），面板在 iframe 里按自己的视口渲染 —— 顶栏与面板零重叠，且完全不碰第三方文件。安装时把这两个文件拷到 `$TRIM_PKGVAR/ui/`（`install_callback` 里的 `_frame` 循环），选择页的入口指向它们。
-32. **`config_callback` 必须自己 `export MIPROXY_KEEP_ADMIN=1`**。管理服务调 `config_callback` 时会在环境里带这个标记，但 **fnOS 向导触发的 `config_callback` 不会带** —— 而 `config_callback` 内部要 `main stop` 重启内核，`main stop` 默认会把管理服务一起停掉，于是用户正开着的页面当场断线（表现为「应用崩了、要手动启动」）。内核重启与管理服务本就是两个独立进程，改配置不该牵连管理服务，所以这个标记要由 `config_callback` 自己无条件设置，不能指望调用方。
+32. **`config_callback` 必须自己 `export MIPROXY_KEEP_ADMIN=1`**。管理服务调 `config_callback` 时会在环境里带这个标记，但 **fnOS 向导触发的 `config_callback` 不会带** —— `config_callback` 内部要重启内核，若走「全家桶」重启（`main stop`/`restart`）会把管理服务一起停掉，于是用户正开着的页面当场断线（表现为「应用崩了、要手动启动」）。内核重启与管理服务本就是两个独立进程，改配置不该牵连管理服务，所以这个标记要由 `config_callback` 自己无条件设置，不能指望调用方。同时 `config_callback` 现在用 **`main restart-kernel`**（只重启内核 + 刷新守护进程，不动管理服务），更彻底地解耦。
 33. **下载订阅必须带 `User-Agent: clash.meta`**。绝大多数订阅服务按 UA 决定返回格式：用 curl 默认 UA（`curl/8.x`）去拿，拿回来是 **base64 编码的 v2ray 链接**而不是 YAML —— 现象是「订阅下载成功、proxies 0 行、节点一个都没有」，极易被误判成解析 bug。三处下载（`install_callback` / `config_callback` / `refresh_sub`）统一走 `cmd/sub_download.sh` 的 `download_subscription()`：带 `clash.meta` 取一次，不像 Clash YAML 就换 `ClashforWindows/0.20.39` 再取一次，仍不像就把原文件留下供诊断（返回码 2）。**新增下载入口时不要再直接写 `curl`**，否则这个坑会再踩一遍。
 34. **订阅解析出 0 个节点必须判失败**。`proxies:` 与 `proxy-providers:` 都为 0 时，config.yaml 里一条节点都没有，用户却看到「已启用」。现在 `config_callback` 会：①用 `diagnose_subscription()` 判定是 base64 / HTML / JSON / 缺段；②**旧配置里还有节点就保留旧配置并 `exit 4`**（绝不用空配置洗掉还能用的节点）；③旧配置也没节点才继续写，并仍以 `exit 4` 收尾。管理服务按返回码分流：**3 = 内核重启失败、4 = 订阅无节点**，其余按未知错误处理。
 35. **`exit 4` 的诊断要从日志里捞，别在服务端另写一套判断**：`admin_server._last_interesting_log_line()` 按关键词优先级从 `info.log` 尾部取最后一条命中行（优先取「为什么坏」的诊断行，再取「做了什么」的处置行），把脚本的原话带回接口错误信息。两处判断各写一遍必然对不上。
@@ -228,6 +229,10 @@ miproxy-fpk/
     ```
 
     这份 YAML 对内核是**合法**的，节点能正常加载；但任何「按缩进切段」的简易解析器（管理服务的 `parse_config_proxies`、脚本里的 `config_has_nodes`）都会在**第一个顶格 `-` 处认为 `proxies` 段已经结束**，于是读出 0 个节点。现象极具迷惑性：订阅下载成功、config.yaml 重新生成成功、内核也正常跑着，**唯独管理界面一个节点都没有**，用户完全看不出问题在哪（v2.8.5 之前就是这样）。现在有三道防线：①`extract_yaml_block` 抽完块统一 `normalize()`，把顶格列表项缩进到父键下，输出规范 YAML；②`admin_server.parse_config_proxies` 兼容顶格写法（**升级后不用重新应用配置也能立刻看到节点**，因为 NAS 上已有的旧 `config.yaml` 还是顶格的）；③生成 `config.yaml` 时先写临时文件、`count_yaml_nodes()` 回读校验节点数，0 节点直接 `exit 4` 且**不覆盖正在生效的配置**。**新增任何按 YAML 缩进切段的解析代码，都必须同时认这两种写法**（判定段结束的条件是「顶格且不是 `-`」）。另：脚本里数节点条数统一用 `count_yaml_nodes()`，不要另写一份计数逻辑——两份计数必然对不上。**「生成结果 0 节点就判失败」这条只针对「订阅里本来就有内联节点」**：`proxy-providers` 型订阅的节点由 provider 在运行时拉取，`config.yaml` 里本来就没有内联节点，不能当成失败（判定用 `SUB_INLINE_NODES`，不是 `SUB_HAS_NODES`）。
+
+37. **切换订阅不再「全家桶重启」**：`config_callback` 过去用 `main stop` + `main start` 应用新配置，会顺手停掉刷新守护进程和管理服务，且内核重启到完成之间有十几秒窗口，fnOS 靠 `main status`（0=运行 / 3=停止）巡检，抓到这一瞬就把应用标成「已停止」——这正是「切换订阅后应用直接停止、需要手动启动」的成因。现在改为 **`main restart-kernel`**：①**只重启内核进程**，管理服务与订阅刷新守护进程原地不动；②重启窗口内 `main` 写 `RESTART_FLAG`（数据目录 `restarting`，内容为持标进程 PID），`status` 在标记有效期内（持标进程存活且未超 5 分钟）仍返回 0，fnOS 不会误判；③内核启动统一 `nohup`，避免被 `config_callback` / `restart-kernel` 这些瞬态调用进程退出时的 SIGHUP 带走。只有在需要整族重启（改到 TUN 之外的运行参数）时才用 `main restart`。`restart-kernel` 与 `restart` 都加 `mark_restarting`/`clear_restarting` 成对包裹。
+38. **切换 / 保存配置要有进度反馈 + 屏蔽并发**：`config_callback` 全程写 `apply.progress`（`stage` / `percent` / `message`，UTF-8），阶段为 `downloading` → `parsing` → `generating` → `restarting` → `done` / `failed`；管理服务把「应用配置」改成**后台线程异步执行**，POST `/api/settings`、`/api/subscriptions` 返回 **202**（而非同步 200），前端轮询 `/api/apply/progress`，并在应用期间弹**遮罩**阻止用户再点切换 / 保存。「切换订阅」与「定时刷新」通过 `apply.lock`（目录锁 + `pid` 文件，跨进程串行化）互斥，冲突时 `config_callback` 返回 **5**，前端提示「另一个操作正在进行」。新增「触发配置应用」的路径时，务必：①带 `MIPROXY_KEEP_ADMIN=1`（不杀管理服务）；②不要自己 `main stop`（用 `restart-kernel`）；③写 `apply.progress` 让前端有反馈；④尊重 `apply.lock`（守护进程自己持锁调用时传 `MIPROXY_APPLY_LOCKED=1`，避免自锁死）。
+39. **重装 / 升级不再抹掉面板已配的订阅**：fnOS 升级时再次执行 `install_callback`，而它原本无条件整体重写 `settings.conf`，于是「首次装选了『暂不配置』→ 之后在面板配好远程订阅 → 更新安装又被打回 none」。现在 `install_callback` 检测到既有 `settings.conf` 时，向导给的是默认值（none / 空）就**沿用旧配置**（订阅类型 / 链接 / 密钥 / HTTP/API 端口 / 刷新间隔 / 管理端口令牌全保留），只有向导显式给了新值才覆盖；首次安装行为不变。判定「显式指定」的规则：远程订阅需 `wizard_sub_type=remote` 且 `wizard_sub_url` 非空、本地订阅需路径真实存在。在管理界面改过订阅后重装不会丢，除非你确实想在向导里重新指定。
 
 ---
 

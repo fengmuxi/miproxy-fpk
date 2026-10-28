@@ -21,108 +21,90 @@ log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"
 }
 
-# 完整版 yaml 块提取：支持订阅源特殊格式（proxies: 块中列表项为顶格 -）
-extract_yaml_block() {
-    # 解析失败不再静默丢弃：stderr 统一写入 info.log（python3 缺失/文件不可读/语法错误均可追溯）
-    python3 - "$1" "$2" 2>>"${LOG_FILE:-/dev/null}" <<'PYEOF'
-import sys
-key = sys.argv[1] + ":"
-try:
-    with open(sys.argv[2], 'r', encoding='utf-8') as f:
-        lines = f.readlines()
-except Exception as e:
-    sys.stderr.write("[extract_yaml_block] 读取订阅缓存失败: %s (%s: %s)\n" % (sys.argv[2], type(e).__name__, e))
-    sys.exit(3)
-result = []
-found = False
-for line in lines:
-    stripped = line.rstrip('\n')
-    if not stripped.strip():
-        if found: result.append(line)
-        continue
-    is_top = not stripped[0].isspace()
-    if is_top:
-        if stripped.startswith(key):
-            found = True
-            result.append(line)
-        elif found:
-            if stripped.startswith('-'):
-                result.append(line)
-            else:
-                break
-    elif found:
-        result.append(line)
+# 进度阶段上报：把「正在做什么」写到 progress 文件里，
+# 管理服务轮询它就能在界面上显示「下载订阅信息 → 解析中 → 生成配置中 →
+# 重启内核中 → 已完成」，而不是让用户对着一个转圈的按钮干等。
+#
+# 格式：每行一个 key=value，UTF-8。管理服务只读不写。
+PROGRESS_FILE="${VAR_DIR}/apply.progress"
 
+progress_reset() {
+    {
+        echo "stage=start"
+        echo "percent=0"
+        echo "message=准备中"
+    } > "${PROGRESS_FILE}" 2>/dev/null
+}
 
-def normalize(block):
-    """把「顶格 - 」的列表项缩进到父键下面，输出规范的 YAML 块。
+progress_set() {
+    # $1=stage $2=percent $3=message
+    {
+        echo "stage=$1"
+        echo "percent=$2"
+        echo "message=$3"
+    } > "${PROGRESS_FILE}" 2>/dev/null
+    log_msg "  ▶ [$1] $3"
+}
 
-    为什么必须做：YAML 允许序列与父键同缩进，所以
-        proxies:
-        - name: A
-    对内核是合法的（节点能正常加载），但一堆简易解析器
-    （包括本项目早期版本的管理服务）是按「块内必须缩进」来切段的，
-    遇到顶格就认为 proxies 段结束 —— 于是订阅明明有 80 多个节点，
-    管理界面却显示 0 个，用户完全看不出问题在哪。
-    统一缩进成规范写法，两边就都对了。
-    """
-    if len(block) <= 1:
-        return block
-    body = block[1:]
-    min_indent = None
-    for l in body:
-        if not l.strip():
+progress_clear() {
+    rm -f "${PROGRESS_FILE}" 2>/dev/null
+}
+
+# ============ 应用锁（跨进程）============
+# 「面板切换订阅」与「刷新守护进程定时刷新」都会调本脚本，两者撞在一起会
+# 互相重写 config.yaml、互相重启内核，表现为「配置没生效」或「应用被停了」。
+# 用一个锁文件把两者串行化。
+#
+# MIPROXY_APPLY_LOCKED=1 表示「调用方已经持锁」（刷新守护进程自己持锁后再调本脚本），
+# 此时不再重复加锁，避免自锁死。
+APPLY_LOCK_FILE="${VAR_DIR}/apply.lock"
+
+apply_lock_acquire() {
+    if [ "${MIPROXY_APPLY_LOCKED:-0}" = "1" ]; then
+        return 0
+    fi
+    local waited=0 pid
+    while true; do
+        if mkdir "${APPLY_LOCK_FILE}.d" 2>/dev/null; then
+            echo "$$" > "${APPLY_LOCK_FILE}.d/pid" 2>/dev/null
+            return 0
+        fi
+        # 残留锁：持锁进程已消失 → 清掉重试
+        pid=$(head -n 1 "${APPLY_LOCK_FILE}.d/pid" 2>/dev/null | tr -d '[:space:]')
+        if [ -z "${pid}" ] || ! kill -0 "${pid}" 2>/dev/null; then
+            log_msg "  清理残留的应用锁（上次执行异常退出）"
+            rm -rf "${APPLY_LOCK_FILE}.d" 2>/dev/null
             continue
-        indent = len(l) - len(l.lstrip(' '))
-        if min_indent is None or indent < min_indent:
-            min_indent = indent
-    if min_indent is None or min_indent > 0:
-        return block          # 本来就是缩进好的，不用动
-    out = [block[0]]
-    for l in body:
-        out.append(('  ' + l) if l.strip() else l.rstrip('\n'))
-    return out
-
-
-sys.stdout.write(''.join(normalize(result)))
-PYEOF
+        fi
+        waited=$((waited + 1))
+        # 最多等 120 秒；超时就放弃，交给调用方报「有其它操作正在进行」
+        if [ ${waited} -ge 120 ]; then
+            return 1
+        fi
+        sleep 1
+    done
 }
 
-# 统计一个 YAML 文件里 proxies 段的条目数（顶格/缩进两种写法都认）
-count_yaml_nodes() {
-    python3 - "$1" 2>>"${LOG_FILE:-/dev/null}" <<'PYEOF'
-import sys
-path = sys.argv[1]
-try:
-    lines = open(path, encoding='utf-8', errors='replace').read().splitlines()
-except Exception:
-    print("0")
-    sys.exit(0)
-inblk = False
-count = 0
-for raw in lines:
-    if not inblk:
-        if raw.strip() == "proxies:":
-            inblk = True
-        continue
-    if raw and not raw[0].isspace():
-        if raw.startswith("-"):
-            count += 1
-        else:
-            break
-        continue
-    line = raw.strip()
-    if not line or line.startswith("#"):
-        continue
-    if line.startswith("-"):
-        count += 1
-print(count)
-PYEOF
+apply_lock_release() {
+    if [ "${MIPROXY_APPLY_LOCKED:-0}" = "1" ]; then
+        return 0
+    fi
+    rm -rf "${APPLY_LOCK_FILE}.d" 2>/dev/null
 }
+
+# extract_yaml_block / count_yaml_nodes 已统一到 miproxy_config_lib.sh（install_callback
+# 与 config_callback 共用）。本脚本在顶部已 source 该库，下方直接调用即可。
+
 
 # 订阅下载统一入口（带 Clash 专用 UA，见 cmd/sub_download.sh 顶部说明）
 if [ -f "${SCRIPT_DIR}/sub_download.sh" ]; then
     . "${SCRIPT_DIR}/sub_download.sh"
+fi
+
+# 配置生成共用库（extract_yaml_block / count_yaml_nodes / diagnose_subscription /
+# config_has_nodes / compute_domain_filter / extract_subscription_fields / emit_config_yaml）
+if [ -f "${SCRIPT_DIR}/miproxy_config_lib.sh" ]; then
+    . "${SCRIPT_DIR}/miproxy_config_lib.sh"
 fi
 
 # 防御：fnOS 的向导/管理界面一定会带 wizard_* 环境变量下发。
@@ -155,6 +137,9 @@ if [ -f "${TRIM_PKGETC}/settings.conf" ]; then
     ADMIN_PORT_KEEP=$(grep '^wizard_admin_port=' "${TRIM_PKGETC}/settings.conf" | cut -d= -f2- | tr -d '[:space:]')
     ADMIN_TOKEN_KEEP=$(grep '^wizard_admin_token=' "${TRIM_PKGETC}/settings.conf" | cut -d= -f2- | tr -d '[:space:]')
 fi
+# 环境变量显式传入的优先于旧文件里的（管理端口/令牌允许用环境变量指定）
+[ -n "${wizard_admin_port:-}" ] && ADMIN_PORT_KEEP="${wizard_admin_port}"
+[ -n "${wizard_admin_token:-}" ] && ADMIN_TOKEN_KEEP="${wizard_admin_token}"
 HTTP_PORT="${wizard_http_port:-${HTTP_PORT:-7890}}"
 API_PORT="${wizard_api_port:-${API_PORT:-9090}}"
 
@@ -162,14 +147,21 @@ log_msg "config_callback v7 启动"
 log_msg "  HTTP_PORT=${HTTP_PORT}, API_PORT=${API_PORT}"
 log_msg "  SUB_TYPE=${SUB_TYPE}, SUB_URL=${SUB_URL:-（空）}, PREV=${PREV_SUB_URL:-（空）}"
 
-SUB_DOMAIN_FILTER=""
-if [ "${SUB_TYPE}" = "remote" ] && [ -n "${SUB_URL}" ]; then
-    domain=$(echo "${SUB_URL}" | sed -E 's|^https?://||; s|/.*$||; s|:.*$||')
-    [ -n "${domain}" ] && SUB_DOMAIN_FILTER="    - \"${domain}\"
-    - \"*.${domain}\"
-"
+# 拿应用锁：与刷新守护进程串行化，避免两边同时改配置/重启内核
+progress_reset
+if ! apply_lock_acquire; then
+    log_msg "  ⚠️ 另一个配置应用正在进行（等待超时），本次放弃"
+    progress_set "failed" 100 "另一个配置应用正在进行，请稍后重试"
+    exit 5
 fi
+# 任何退出路径都要释放锁，否则会把后续所有应用都卡住
+trap 'apply_lock_release' EXIT
 
+# 安全提取订阅域名（统一库 miproxy_config_lib.sh）
+compute_domain_filter
+if [ -n "${domain}" ]; then
+    log_msg "  提取订阅域名: ${domain}"
+fi
 SUB_CACHE_PATH="${VAR_DIR}/proxy_providers/subscription.yaml"
 mkdir -p "${VAR_DIR}/proxy_providers"
 
@@ -186,6 +178,7 @@ fi
 
 if [ "${NEED_DOWNLOAD}" = "1" ]; then
     log_msg "下载远程订阅: ${SUB_URL}"
+    progress_set "downloading" 20 "正在下载订阅信息"
     if [ -z "${SUB_URL}" ]; then
         log_msg "  ⚠️ 订阅类型为 remote 但没有订阅链接，跳过下载"
     elif command -v download_subscription >/dev/null 2>&1; then
@@ -223,16 +216,14 @@ if [ -f "${SUB_CACHE_PATH}" ]; then
     log_msg "  📄 订阅缓存: ${CACHE_SIZE} bytes / proxies 条目 ${CACHE_NODES} 个"
     log_msg "      开头: ${CACHE_HEAD}"
 fi
+
+progress_set "parsing" 45 "正在解析订阅内容"
 # 订阅里的内联节点数（proxy-providers 型订阅是 0，那是正常的：
 # 它的节点由 provider 在运行时拉取，config.yaml 里本来就不该有内联节点）
 SUB_INLINE_NODES="${CACHE_NODES:-0}"
 
-# ============ v7: 完整字段同步 ============
+# ============ 完整字段同步（统一库 miproxy_config_lib.sh）============
 # 同步所有来自订阅源的配置字段
-SUB_PROXIES=""; SUB_HOSTS=""; SUB_PG=""; SUB_RULES=""; SUB_DNS=""
-SUB_BYPASS=""; SUB_PROXY_PROVIDERS=""; SUB_RULE_PROVIDERS=""; SUB_SUB_RULE=""
-SUB_TUNNELS=""; SUB_LISTENERS=""; SUB_SNIFF=""; SUB_NTP=""; SUB_SCRIPT=""
-
 HAVE_PY3=1
 if [ -f "${SUB_CACHE_PATH}" ] && ! command -v python3 >/dev/null 2>&1; then
     HAVE_PY3=0
@@ -244,25 +235,12 @@ if [ -f "${SUB_CACHE_PATH}" ] && [ "${SUB_TYPE}" = "none" ]; then
     log_msg "未启用订阅（sub_type=none），忽略已有订阅缓存，生成默认规则配置"
 fi
 
+# 统一解析订阅字段（proxies/hosts/proxy-groups/rules/dns/扩展字段），
+# 与 install_callback 共用同一份逻辑，保证安装与改配置生成的 config 完全一致。
+extract_subscription_fields
+
+# 字段同步统计（便于日志印证）
 if [ -f "${SUB_CACHE_PATH}" ] && [ "${HAVE_PY3}" = "1" ] && { [ "${SUB_TYPE}" = "remote" ] || [ "${SUB_TYPE}" = "local" ]; }; then
-    # 基础字段（原有）
-    SUB_PROXIES=$(extract_yaml_block "proxies" "${SUB_CACHE_PATH}")
-    SUB_HOSTS=$(extract_yaml_block "hosts" "${SUB_CACHE_PATH}")
-    SUB_PG=$(extract_yaml_block "proxy-groups" "${SUB_CACHE_PATH}")
-    SUB_RULES=$(extract_yaml_block "rules" "${SUB_CACHE_PATH}")
-    SUB_DNS=$(extract_yaml_block "dns" "${SUB_CACHE_PATH}")
-    
-    # 扩展字段（v7 新增）
-    SUB_BYPASS=$(extract_yaml_block "bypass" "${SUB_CACHE_PATH}")
-    SUB_PROXY_PROVIDERS=$(extract_yaml_block "proxy-providers" "${SUB_CACHE_PATH}")
-    SUB_RULE_PROVIDERS=$(extract_yaml_block "rule-providers" "${SUB_CACHE_PATH}")
-    SUB_SUB_RULE=$(extract_yaml_block "sub-rule" "${SUB_CACHE_PATH}")
-    SUB_TUNNELS=$(extract_yaml_block "tunnels" "${SUB_CACHE_PATH}")
-    SUB_LISTENERS=$(extract_yaml_block "listeners" "${SUB_CACHE_PATH}")
-    SUB_SNIFF=$(extract_yaml_block "sniff" "${SUB_CACHE_PATH}")
-    SUB_NTP=$(extract_yaml_block "ntp" "${SUB_CACHE_PATH}")
-    SUB_SCRIPT=$(extract_yaml_block "script" "${SUB_CACHE_PATH}")
-    
     log_msg "  📦 字段同步统计:"
     log_msg "      proxies:$(printf '%s' "${SUB_PROXIES}" | wc -l)行"
     log_msg "      hosts:$(printf '%s' "${SUB_HOSTS}" | wc -l)行"
@@ -278,56 +256,15 @@ if [ -f "${SUB_CACHE_PATH}" ] && [ "${HAVE_PY3}" = "1" ] && { [ "${SUB_TYPE}" = 
     log_msg "      sniff:$(printf '%s' "${SUB_SNIFF}" | wc -l)行"
     log_msg "      ntp:$(printf '%s' "${SUB_NTP}" | wc -l)行"
     log_msg "      script:$(printf '%s' "${SUB_SCRIPT}" | wc -l)行"
-    
-    [ -n "${SUB_DNS}" ] && ! printf '%s' "${SUB_DNS}" | grep -q "nameserver" && SUB_DNS="" && log_msg "  ⚠️ dns 缺 nameserver，回退本地默认"
 fi
-
 # ============ 订阅有效性校验 ============
 # 「订阅启用了，却一个节点都没解析出来」是最容易被当成成功的情况：
 # 订阅下载成功（HTTP 200）、config.yaml 也重新生成了，但里面一条 proxies 都没有，
 # 用户看到的只是「已生效」，实际节点数为 0。
 # 这里做两件事：①说清楚到底是哪种格式问题；②绝不用一份空配置覆盖掉还能用的旧配置。
-diagnose_subscription() {
-    python3 - "${1}" 2>>"${LOG_FILE}" <<'PYEOF'
-import sys, re
-p = sys.argv[1]
-try:
-    data = open(p, 'rb').read()
-except Exception as e:
-    print("订阅缓存读取失败（%s）" % e)
-    sys.exit(0)
-if not data:
-    print("订阅缓存是空文件")
-    sys.exit(0)
-text = data.decode('utf-8', 'replace')
-head = ' '.join(text[:120].split())
-size = len(data)
-stripped = text.strip()
-if re.match(r'^\s*(<\?xml|<!DOCTYPE|<html)', text, re.I):
-    print("订阅返回的是 HTML 网页而不是配置（链接可能需要 User-Agent/令牌，或被中间层劫持）；开头：%s" % head)
-elif stripped.startswith('{') or stripped.startswith('['):
-    print("订阅返回的是 JSON 而不是 Clash YAML；开头：%s" % head)
-elif ':' not in stripped and re.match(r'^[A-Za-z0-9+/=\s]{40,}$', stripped):
-    print("订阅返回的是 base64 编码内容（多半是 v2ray/ss 链接），需先转换成 Clash/mihomo 格式；开头：%s" % head[:60])
-elif 'proxies:' not in text and 'proxy-providers:' not in text:
-    print("订阅里没有 proxies: / proxy-providers: 段（共 %d 字节，开头：%s）" % (size, head))
-else:
-    print("订阅格式可疑（共 %d 字节，开头：%s）" % (size, head))
-PYEOF
-}
+# diagnose_subscription / config_has_nodes 已统一到 miproxy_config_lib.sh（install_callback
+# 与 config_callback 共用），本脚本已 source 该库，下方直接调用即可。
 
-# 当前 config.yaml 里还有没有节点（用于决定能否覆盖）
-# 复用 count_yaml_nodes：它认得「顶格 - 」和「缩进 - 」两种写法，
-# 早前这里只认缩进，顶格写法会被误判成「没有节点」，于是保护逻辑形同虚设。
-config_has_nodes() {
-    local n
-    n=$(count_yaml_nodes "${CONFIG_FILE}")
-    if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
-        echo "yes"
-    else
-        echo "no"
-    fi
-}
 
 SUB_HAS_NODES=1
 if [ "${SUB_TYPE}" = "remote" ] || [ "${SUB_TYPE}" = "local" ]; then
@@ -347,83 +284,12 @@ if [ "${SUB_TYPE}" = "remote" ] || [ "${SUB_TYPE}" = "local" ]; then
 fi
 
 log_msg "重新生成 config.yaml..."
+progress_set "generating" 60 "正在生成配置文件"
 
-{
-    echo "# MiProxy 主配置（v7：完整同步订阅源所有字段）"
-    echo ""
-    echo "mixed-port: ${HTTP_PORT}"
-    echo "allow-lan: true"
-    echo "mode: rule"
-    echo "log-level: info"
-    echo "ipv6: false"
-    echo "external-controller: 0.0.0.0:${API_PORT}"
-    echo "external-ui: ${UI_TARGET}"
-    echo "external-ui-name: zashboard"
-    [ -n "${SECRET}" ] && echo "secret: \"${SECRET}\""
-    [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASS}" ] && echo "authentication:" && echo "  - \"${PROXY_USER}:${PROXY_PASS}\""
-    echo "external-controller-cors:"
-    echo "  allow-private-network: true"
-    echo "  allow-origins: [\"*\"]"
-    echo "geodata-mode: true"
-    echo "geodata-loader: memconservative"
-    echo "tun:"
-    echo "  enable: ${TUN_ENABLE}"
-    echo "  stack: mixed"
-    echo "  auto-route: true"
-    echo "  auto-redirect: true"
-    echo "  auto-detect-interface: true"
-    echo "  device: miproxy"
-    echo "  mtu: 1500"
-    echo "  dns-hijack: [\"any:53\", \"tcp://any:53\"]"
-    echo "  strict-route: true"
-    echo "  gso: true"
-    echo "  gso-max-size: 65536"
+# 统一生成入口（miproxy_config_lib.sh 的 emit_config_yaml），
+# 与 install_callback 共用，保证安装与改配置生成的 config 完全一致。
+emit_config_yaml
 
-    # ============ 来自订阅源的字段 ============
-    [ -n "${SUB_PROXIES}" ] && echo "# 节点列表（来自订阅源）" && echo "${SUB_PROXIES}"
-    [ -n "${SUB_HOSTS}" ] && echo "# hosts（来自订阅源）" && echo "${SUB_HOSTS}"
-
-    if [ -n "${SUB_PG}" ]; then
-        echo "# 代理组（来自订阅源）"
-        echo "${SUB_PG}"
-    else
-        echo "proxy-groups:"
-        echo "  - name: PROXY"
-        echo "    type: select"
-        echo "    proxies: [DIRECT, REJECT]"
-    fi
-
-    if [ -n "${SUB_RULES}" ]; then
-        echo "# 路由规则（来自订阅源）"
-        echo "${SUB_RULES}"
-    else
-        echo "rules: [\"GEOIP,CN,DIRECT\", \"MATCH,PROXY\"]"
-    fi
-
-    if [ -n "${SUB_DNS}" ]; then
-        echo "# DNS（来自订阅源）"
-        echo "${SUB_DNS}"
-    else
-        echo "dns:"
-        echo "  enable: true"
-        echo "  listen: 0.0.0.0:53"
-        echo "  enhanced-mode: fake-ip"
-        echo "  fake-ip-range: 198.18.0.1/16"
-        echo "  fake-ip-filter: [\"+.lan\", \"+.local\"${SUB_DOMAIN_FILTER:+, \"${domain}\", \"*.${domain}\"}]"
-        echo "  nameserver: [223.5.5.5, 119.29.29.29, 8.8.8.8]"
-    fi
-
-    # v7 新增字段
-    [ -n "${SUB_BYPASS}" ] && echo "# bypass 私有绕过列表（来自订阅源）" && echo "${SUB_BYPASS}"
-    [ -n "${SUB_PROXY_PROVIDERS}" ] && echo "# proxy-providers 代理集合（来自订阅源）" && echo "${SUB_PROXY_PROVIDERS}"
-    [ -n "${SUB_RULE_PROVIDERS}" ] && echo "# rule-providers 规则集合（来自订阅源）" && echo "${SUB_RULE_PROVIDERS}"
-    [ -n "${SUB_SUB_RULE}" ] && echo "# sub-rule 子规则（来自订阅源）" && echo "${SUB_SUB_RULE}"
-    [ -n "${SUB_TUNNELS}" ] && echo "# tunnels 流量隧道（来自订阅源）" && echo "${SUB_TUNNELS}"
-    [ -n "${SUB_LISTENERS}" ] && echo "# listeners 监听器（来自订阅源）" && echo "${SUB_LISTENERS}"
-    [ -n "${SUB_SNIFF}" ] && echo "# sniff 嗅探（来自订阅源）" && echo "${SUB_SNIFF}"
-    [ -n "${SUB_NTP}" ] && echo "# ntp 时间同步（来自订阅源）" && echo "${SUB_NTP}"
-    [ -n "${SUB_SCRIPT}" ] && echo "# script 脚本（来自订阅源）" && echo "${SUB_SCRIPT}"
-} > "${CONFIG_TMP}"
 
 # ⚠️ 先写临时文件、校验通过再落位：
 # 绝不把一份「节点数为 0」的 config.yaml 盖到正在生效的配置上。
@@ -461,24 +327,31 @@ chmod 666 "${TRIM_PKGETC}/settings.conf" 2>/dev/null
 rm -f "${VAR_DIR}/base.yaml" "${VAR_DIR}/subscription.yaml" "${VAR_DIR}/subscription.conf"
 
 # MIPROXY_NO_RESTART=1：由 refresh_sub 定时刷新调用时只重生成 config.yaml，不碰内核。
-# 原因：main stop 会 kill 掉调用方（订阅刷新守护进程自己），且守护进程本来就会紧接着重启内核。
+# 原因：守护进程本来就会紧接着自己重启内核，这里再重启一次就是自己杀自己。
 if [ "${MIPROXY_NO_RESTART:-0}" = "1" ]; then
     log_msg "MIPROXY_NO_RESTART=1，跳过内核重启（由调用方负责重启）"
 else
-    # ⚠️ 必须保留管理服务：main stop 默认会把管理服务一起停掉，那样
-    # ① 正在打开的管理页面请求被中断，用户看到「应用崩了」；
-    # ② 被 fnOS 向导触发时（那条路径不会带 MIPROXY_KEEP_ADMIN）更是必停。
-    # 内核重启与管理服务本就是两个独立进程，改配置不该牵连管理服务。
+    # ⚠️ 这里以前是 `main stop` + `main start` 的全量重启，代价很大：
+    #   ① 停掉的不只是内核，还有刷新守护进程和管理服务；
+    #   ② 停内核到重启完成之间有十几秒「内核不在」的窗口，而 fnOS 正是靠
+    #      `main status` 的退出码（0=运行/3=停止）判断应用生死 —— 巡检到这一瞬
+    #      就会把应用标成「已停止」，用户看到的就是「切换订阅后应用直接停止、
+    #      需要手动启动」。
+    # 现在改成 `main restart-kernel`：只换内核进程，管理服务与守护进程原地不动，
+    # 并且重启期间 main status 仍返回 0（见 main 的 RESTART_FLAG 机制）。
+    progress_set "restarting" 85 "正在重启内核"
     export MIPROXY_KEEP_ADMIN=1
-    bash "${SCRIPT_DIR}/main" stop 2>>"${LOG_FILE}" || true
-    sleep 2
-    if bash "${SCRIPT_DIR}/main" start 2>>"${LOG_FILE}"; then
-        log_msg "✅ miproxy 重启成功"
+    if bash "${SCRIPT_DIR}/main" restart-kernel 2>>"${LOG_FILE}"; then
+        log_msg "✅ miproxy 内核重启成功"
+        # 订阅类型/刷新间隔可能变了，让刷新守护进程与新设置对齐
+        # （none→remote 且开了间隔要起守护进程；remote→none 要停掉）
+        bash "${SCRIPT_DIR}/main" sync-daemon 2>>"${LOG_FILE}" || true
     else
         # 重启失败必须让调用方感知：config.yaml 已经写好了，但内核还在跑旧配置（或根本没起来），
         # 这时候「保存成功」是假象 —— 管理界面会据此提示「配置已写入但内核未重启」。
-        log_msg "⚠️  miproxy 重启失败：config.yaml 已写入，但内核仍是旧配置或未运行"
+        log_msg "⚠️  miproxy 内核重启失败：config.yaml 已写入，但内核仍是旧配置或未运行"
         log_msg "===== config_callback v7 完成（重启失败）====="
+        progress_set "failed" 100 "内核重启失败，配置未生效"
         exit 3
     fi
 fi
@@ -487,7 +360,9 @@ if [ "${SUB_HAS_NODES}" = "0" ]; then
     # 必须让调用方知道「没生效」，否则用户看到的仍是「已启用」。
     log_msg "⚠️  订阅未解析出任何节点：配置已写入，但不会有可用节点"
     log_msg "===== config_callback v7 完成（订阅无节点）====="
+    progress_set "failed" 100 "订阅未解析出任何节点"
     exit 4
 fi
 log_msg "===== config_callback v7 完成 ====="
+progress_set "done" 100 "已完成"
 exit 0

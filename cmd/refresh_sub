@@ -11,6 +11,8 @@ MIHOMO_CONFIG="${TRIM_PKGVAR}/config.yaml"
 MIHOMO_DIR="${TRIM_PKGVAR}"
 LOCK_FILE="${TRIM_PKGVAR}/refresh_sub.lock"
 REFRESH_PID_FILE="${TRIM_PKGVAR}/refresh_sub.pid"
+# 跨进程应用锁目录（与 config_callback 用的是同一个，见该脚本 apply_lock_acquire）
+APPLY_LOCK_DIR="${TRIM_PKGVAR}/apply.lock"
 
 # 订阅下载统一入口（带 Clash 专用 UA，见 cmd/sub_download.sh 顶部说明）。
 # 本脚本会被复制到数据目录运行，所以辅助脚本要跟着一起复制（见 cmd/main 的
@@ -188,17 +190,33 @@ apply_config() {
         esac
     done < "${TRIM_PKGETC}/settings.conf"
 
-    local script
-    script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config_callback"
-    if [ ! -f "${script}" ]; then
-        log_msg "重生成配置失败: 找不到 config_callback (${script})"
+    # ⚠️ config_callback 可能不在守护进程旁边：
+    # 本脚本被复制到 ${TRIM_PKGVAR}/refresh_sub 运行，而 config_callback 同步到
+    # ${TRIM_PKGVAR}/cmd/config_callback。只看脚本自己所在目录会永远找不到
+    # （守护进程每次刷新都失败，表现为「自动刷新没生效」）。
+    # 按「数据目录 → 安装目录 → 常见布局 → 脚本自身目录」依次探测。
+    local script=""
+    for _c in "${TRIM_PKGVAR}/cmd/config_callback" "${TRIM_APPDEST}/cmd/config_callback" \
+              "/var/apps/miproxy/cmd/config_callback" "/var/packages/miproxy/cmd/config_callback" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config_callback"; do
+        if [ -f "${_c}" ]; then
+            script="${_c}"
+            break
+        fi
+    done
+    unset _c
+    if [ -z "${script}" ]; then
+        log_msg "重生成配置失败: 找不到 config_callback（已查：${TRIM_PKGVAR}/cmd、${TRIM_APPDEST}/cmd、/var/apps、/var/packages、脚本同目录）"
         return 1
     fi
 
+    # 守护进程自己持应用锁后再调 config_callback：
+    # 否则面板那边正在切换订阅时，两边会同时重写 config.yaml、同时重启内核。
+    # MIPROXY_APPLY_LOCKED=1 告诉 config_callback「锁已持有，不要重复加锁」。
     if [ "${mode}" = "no-restart" ]; then
-        MIPROXY_NO_RESTART=1 bash "${script}"
+        MIPROXY_NO_RESTART=1 MIPROXY_APPLY_LOCKED=1 bash "${script}"
     else
-        bash "${script}"
+        MIPROXY_APPLY_LOCKED=1 bash "${script}"
     fi
     return $?
 }
@@ -218,7 +236,28 @@ do_refresh() {
     fi
     echo "$$" > "${LOCK_FILE}"
 
+    # 跨进程应用锁：与「面板切换订阅」互斥。
+    # 面板正在切换时守护进程要等，反之亦然 —— 否则两边同时下载、同时写
+    # config.yaml、同时重启内核，表现为「配置时有时无」「应用莫名停止」。
+    local waited=0 lock_pid
+    while ! mkdir "${APPLY_LOCK_DIR}.d" 2>/dev/null; do
+        lock_pid=$(head -n 1 "${APPLY_LOCK_DIR}.d/pid" 2>/dev/null | tr -d '[:space:]')
+        if [ -z "${lock_pid}" ] || ! kill -0 "${lock_pid}" 2>/dev/null; then
+            rm -rf "${APPLY_LOCK_DIR}.d" 2>/dev/null
+            continue
+        fi
+        waited=$((waited + 1))
+        if [ ${waited} -ge 120 ]; then
+            log_msg "面板正在应用配置，本次刷新跳过"
+            rm -f "${LOCK_FILE}"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "$$" > "${APPLY_LOCK_DIR}.d/pid" 2>/dev/null
+
     if ! fetch_subscription; then
+        rm -rf "${APPLY_LOCK_DIR}.d" 2>/dev/null
         rm -f "${LOCK_FILE}"
         return 1
     fi
@@ -226,17 +265,20 @@ do_refresh() {
     # 关键：先把新订阅写进 config.yaml，再重启内核，否则重启的仍是旧配置
     if ! apply_config no-restart; then
         log_msg "重新生成配置失败，跳过本次重启（继续沿用上一份配置）"
+        rm -rf "${APPLY_LOCK_DIR}.d" 2>/dev/null
         rm -f "${LOCK_FILE}"
         return 1
     fi
 
     if restart_mihomo; then
         log_msg "已应用新订阅：config.yaml 已重生成，mihomo 已重启"
+        rm -rf "${APPLY_LOCK_DIR}.d" 2>/dev/null
         rm -f "${LOCK_FILE}"
         return 0
     fi
 
     log_msg "config.yaml 已更新，但 mihomo 重启失败（见上方日志）"
+    rm -rf "${APPLY_LOCK_DIR}.d" 2>/dev/null
     rm -f "${LOCK_FILE}"
     return 1
 }

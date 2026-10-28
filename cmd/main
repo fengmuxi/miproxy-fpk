@@ -7,6 +7,12 @@ LOG_FILE="${TRIM_PKGVAR}/info.log"
 PID_FILE="${TRIM_PKGVAR}/app.pid"
 REFRESH_PID_FILE="${TRIM_PKGVAR}/refresh_sub.pid"
 ADMIN_PID_FILE="${TRIM_PKGVAR}/admin.pid"
+# 「内核正在重启」标记文件。
+# 为什么需要它：fnOS 靠 `main status` 的退出码判断应用生死（0=运行 / 3=停止），
+# 换配置必然要重启内核，中间会有几秒内核不在。fnOS 巡检到这一瞬就会把应用
+# 标成「已停止」，用户看到的就是「切换订阅后应用直接停止、需要手动启动」。
+# 所以重启期间让 status 继续返回 0，等于告诉 fnOS「我还活着，只是内核在换」。
+RESTART_FLAG="${TRIM_PKGVAR}/restarting"
 MAIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # MiProxy 核心路径
@@ -41,12 +47,26 @@ is_running() {
         pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
         if check_process "${pid}"; then
             return 0
-        else
-            # 清理过期的 PID 文件
-            rm -f "${PID_FILE}"
         fi
+        # kill -0 判不出来时别急着删 PID 文件 —— 先看内核的代理端口在不在监听。
+        # 内核起来就一定会占着 mixed-port，所以「端口在监听」是比 PID 更可靠的
+        # 存活证据：PID 判定可能因为 PID 命名空间差异而误判（本地 Windows 调试
+        # 就是 native PID vs MSYS PID），但端口不会骗人。
+        if kernel_port_listening; then
+            return 0
+        fi
+        # 清理过期的 PID 文件
+        rm -f "${PID_FILE}"
     fi
     return 1
+}
+
+# 内核的代理端口是否在监听（比 PID 文件更可靠的存活证据）
+kernel_port_listening() {
+    local port
+    port=$(grep '^wizard_http_port=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')
+    port="${port:-7890}"
+    (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null
 }
 
 # ============ 订阅刷新守护进程管理 ============
@@ -177,6 +197,124 @@ stop_refresh_daemon() {
     fi
 }
 
+# ============ 内核重启（不牵连管理服务与刷新守护进程）============
+#
+# 为什么需要单独一套「只重启内核」：
+# config_callback 过去用 `main stop` + `main start` 来应用新配置，那会把
+# ①刷新守护进程 ②管理服务 ③内核 一起停掉再拉起。后果是：
+#   - 停内核到重启完成之间有十几秒窗口，fnOS 靠 `main status` 的退出码
+#     （0=运行 / 3=停止）判断应用生死，巡检到就会把应用标成「已停止」，
+#     用户看到的就是「切换订阅后应用直接停止、需要手动启动」。
+#   - stop/start 还会顺手停掉刷新守护进程，把「订阅刷新」与「切换订阅」
+#     变成两件互相打架的事。
+# 所以这里提供 restart_kernel：只换内核进程，管理服务与守护进程原地不动。
+
+# 停内核（不含守护进程/管理服务）
+stop_kernel_only() {
+    local pid=""
+    if [ -r "${PID_FILE}" ]; then
+        pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
+    fi
+    if [ -z "${pid}" ] || ! check_process "${pid}"; then
+        rm -f "${PID_FILE}"
+        return 0
+    fi
+    log_msg "停止内核 (PID: ${pid})..."
+    kill -TERM "${pid}" >> "${LOG_FILE}" 2>&1 || true
+    local count=0
+    while check_process "${pid}" && [ $count -lt 10 ]; do
+        sleep 1
+        count=$((count + 1))
+    done
+    if check_process "${pid}"; then
+        kill -KILL "${pid}" 2>/dev/null || true
+        sleep 1
+    fi
+    rm -f "${PID_FILE}"
+    return 0
+}
+
+# 启内核（不含守护进程/管理服务）
+start_kernel_only() {
+    if is_running; then
+        log_msg "内核已在运行"
+        return 0
+    fi
+    if [ ! -x "${MIHOMO_BIN}" ]; then
+        log_msg "错误: mihomo 二进制不存在或不可执行: ${MIHOMO_BIN}"
+        return 1
+    fi
+    if [ ! -f "${MIHOMO_CONFIG}" ]; then
+        log_msg "错误: mihomo 配置文件不存在: ${MIHOMO_CONFIG}"
+        return 1
+    fi
+    log_msg "启动内核 (cmd: ${CMD})..."
+    # nohup：内核是常驻服务，绝不能随调用方（install_callback / config_callback /
+    # restart-kernel 这些瞬态 bash 进程）退出而被 SIGHUP 带走。
+    # 否则「切换订阅 → 重启内核」后调用方进程结束，内核会一起死掉，fnOS 巡检到就判
+    # 应用停止，用户看到的就是「切换订阅后应用直接停止、需要手动启动」。
+    nohup "${MIHOMO_BIN}" -d "${MIHOMO_DIR}" -f "${MIHOMO_CONFIG}" >> "${LOG_FILE}" 2>&1 &
+    local pid=$!
+    printf "%s" "${pid}" > ${PID_FILE}
+    sleep 2
+    if check_process "${pid}"; then
+        log_msg "内核启动完成 (PID: ${pid})"
+        return 0
+    fi
+    log_msg "错误: 内核启动后立即退出，请检查 ${LOG_FILE}"
+    rm -f "${PID_FILE}"
+    return 1
+}
+
+# 重启内核：只换内核进程，管理服务与刷新守护进程都不动。
+# 返回码：0=成功，1=失败
+restart_kernel() {
+    stop_kernel_only
+    sleep 1
+    start_kernel_only
+}
+
+# 重启标记：status 在标记有效期内仍报「运行中」，避免 fnOS 误判应用已停止。
+mark_restarting() {
+    echo "$$" > "${RESTART_FLAG}" 2>/dev/null
+}
+
+clear_restarting() {
+    rm -f "${RESTART_FLAG}" 2>/dev/null
+}
+
+# 标记是否还有效：持锁进程还活着（且不超过 5 分钟）就算「正在重启」
+restart_in_progress() {
+    [ -f "${RESTART_FLAG}" ] || return 1
+    local pid age
+    pid=$(head -n 1 "${RESTART_FLAG}" 2>/dev/null | tr -d '[:space:]')
+    if [ -z "${pid}" ] || ! check_process "${pid}"; then
+        # 持标记的进程没了 —— 可能是上次重启崩了留下的残留，清掉
+        clear_restarting
+        return 1
+    fi
+    # 超过 5 分钟还留着标记，说明异常退出没清干净
+    age=$(find "${RESTART_FLAG}" -mmin +5 2>/dev/null)
+    if [ -n "${age}" ]; then
+        clear_restarting
+        return 1
+    fi
+    return 0
+}
+
+# 刷新守护进程按当前设置对齐（订阅类型/间隔变了就起或停）
+sync_refresh_daemon() {
+    local sub_type sub_url refresh_interval
+    sub_type=$(grep '^wizard_sub_type=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '\r\n')
+    sub_url=$(grep '^wizard_sub_url=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '\r\n')
+    refresh_interval=$(grep '^wizard_refresh_interval=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '\r\n')
+    if [ "${sub_type}" = "remote" ] && [ -n "${sub_url}" ] && [ "${refresh_interval:-0}" -gt 0 ] 2>/dev/null; then
+        start_refresh_daemon
+    else
+        stop_refresh_daemon
+    fi
+}
+
 # ============ 管理服务（Web 管理界面）============
 
 # 运行期脚本的「真实来源目录」。刻意不看 ${TRIM_PKGVAR}/cmd —— 那是同步出来的
@@ -206,7 +344,7 @@ sync_cmd_scripts() {
     local dest="${TRIM_PKGVAR}/cmd"
     mkdir -p "${dest}" 2>/dev/null
     local name
-    for name in main admin_server.py config_callback refresh_sub sub_download.sh; do
+    for name in main admin_server.py config_callback refresh_sub sub_download.sh miproxy_config_lib.sh; do
         [ -f "${src_dir}/${name}" ] || continue
         # 每次都比对内容：只在「不存在时复制」会让升级后数据目录里的旧副本一直生效
         if ! cmp -s "${src_dir}/${name}" "${dest}/${name}" 2>/dev/null; then
@@ -241,12 +379,28 @@ find_admin_script() {
 }
 
 start_admin() {
-    # 已在运行则跳过
+    # 已在运行则跳过。
+    # 存活判定用「端口是否在监听」，而不是「pid 文件里的进程是否活着」：
+    # admin.pid 有两个写入方 —— main 写的是 nohup 起的 $!，admin_server.py 自己
+    # 又会用 os.getpid() 覆写一遍。两者的 PID 语义在某些环境下并不一致（本地
+    # Windows 调试就是 native PID vs MSYS PID），按 pid 判活会误判成「没运行」，
+    # 于是把 pid 文件删掉、或者重复拉起第二个实例抢端口。
+    # 端口在监听才是「管理服务确实活着」的事实。
+    local port
+    port=$(grep '^wizard_admin_port=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')
+    port="${port:-9091}"
+
+    if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
+        log_msg "管理端口 ${port} 已在监听（视为管理服务已在运行），跳过启动"
+        return 0
+    fi
+
     if [ -f "${ADMIN_PID_FILE}" ]; then
         local existing_pid
         existing_pid=$(head -n 1 "${ADMIN_PID_FILE}" 2>/dev/null | tr -d '[:space:]')
-        if check_process "${existing_pid}"; then
-            log_msg "管理服务已在运行 (PID: ${existing_pid})"
+        if [ -n "${existing_pid}" ] && check_process "${existing_pid}"; then
+            # 进程活着但端口还没起来：给它一点时间，别重复拉起
+            log_msg "管理服务进程已在运行 (PID: ${existing_pid})，等待端口就绪"
             return 0
         fi
         rm -f "${ADMIN_PID_FILE}"
@@ -257,7 +411,7 @@ start_admin() {
         return 0
     fi
 
-    local script port
+    local script
     # 先把运行期脚本同步到数据目录，再从中挑选 —— 这样即便当前 main 是从临时的
     # 解包目录跑起来的，管理服务也会从一个长期有效的路径启动。
     sync_cmd_scripts
@@ -266,21 +420,13 @@ start_admin() {
         return 0
     }
 
-    port=$(grep '^wizard_admin_port=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')
-    port="${port:-9091}"
-
-    # 端口已在监听：说明管理服务本身还活着（常见于 MIPROXY_KEEP_ADMIN=1 的原地重启后 pid 文件失准），
-    # 不要再拉起第二个，否则两个进程抢同一端口只会互相拖累日志。
-    if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
-        log_msg "管理端口 ${port} 已在监听（视为管理服务已在运行），跳过启动；若管理页异常请检查端口占用或改 wizard_admin_port"
-        return 0
-    fi
-
     log_msg "启动管理服务 (端口: ${port}, 脚本: ${script})..."
     nohup env TRIM_PKGVAR="${TRIM_PKGVAR}" TRIM_PKGETC="${TRIM_PKGETC}" TRIM_APPDEST="${TRIM_APPDEST}" \
         ADMIN_PORT="${port}" python3 "${script}" >> "${TRIM_PKGVAR}/admin.log" 2>&1 &
     local pid=$!
-    echo "${pid}" > "${ADMIN_PID_FILE}"
+    # 只在 pid 文件不存在时写：管理服务启动后会用 os.getpid() 覆写它（那才是它的真实 pid）。
+    # 这里写 $! 是「兜底」，别反过来把管理服务自己写的正确 pid 覆盖掉。
+    [ -f "${ADMIN_PID_FILE}" ] || echo "${pid}" > "${ADMIN_PID_FILE}"
 
     sleep 1
     if check_process "${pid}"; then
@@ -335,7 +481,9 @@ start_process() {
     log_msg "启动 miproxy (cmd: ${CMD})..."
     # 直接调用而不是 `bash -c "${CMD}"`：后者会按空格重新拆词（路径含空格就废了），
     # 且多一层 shell，$! 拿到的不一定是内核自己的 PID。
-    "${MIHOMO_BIN}" -d "${MIHOMO_DIR}" -f "${MIHOMO_CONFIG}" >> "${LOG_FILE}" 2>&1 &
+    # nohup：内核是常驻服务，必须脱离调用方（main 自身或其它瞬态脚本）进程树，
+    # 否则调用方一退出内核就跟着被 SIGHUP 杀掉。
+    nohup "${MIHOMO_BIN}" -d "${MIHOMO_DIR}" -f "${MIHOMO_CONFIG}" >> "${LOG_FILE}" 2>&1 &
     local pid=$!
     printf "%s" "${pid}" > ${PID_FILE}
 
@@ -411,19 +559,48 @@ stop)
     exit $?
     ;;
 restart)
+    # 全量重启（内核 + 守护进程 + 管理服务）。重启期间打标记，
+    # 免得 fnOS 在 status 上抓到「停止」这一瞬把应用标成已停止。
+    mark_restarting
     stop_process
     sleep 2
     start_process
     rc=$?
     start_admin
+    clear_restarting
     exit ${rc}
+    ;;
+restart-kernel)
+    # 只重启内核：管理服务与刷新守护进程原地不动。
+    # config_callback 用它来应用新配置 —— 不再走 stop+start 全家桶，
+    # 避免「切换订阅 → 应用被判停止 → 需要手动启动」。
+    mark_restarting
+    restart_kernel
+    rc=$?
+    clear_restarting
+    if [ ${rc} -eq 0 ]; then
+        exit 0
+    else
+        echo "miproxy 内核重启失败，请查看 ${LOG_FILE}" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
+        exit 1
+    fi
+    ;;
+sync-daemon)
+    # 订阅类型/刷新间隔变了之后，让刷新守护进程与新设置对齐
+    sync_refresh_daemon
+    exit $?
     ;;
 status)
     if is_running; then
         exit 0
-    else
-        exit 3
     fi
+    # 内核正在重启：仍报「运行中」。
+    # 否则 fnOS 巡检到换配置的中间态就会把应用标成「已停止」，
+    # 用户就得手动去应用中心点启动 —— 这正是「切换订阅后应用直接停止」的成因。
+    if restart_in_progress; then
+        exit 0
+    fi
+    exit 3
     ;;
 *)
     echo "Usage: $0 {start|stop|restart|status}"

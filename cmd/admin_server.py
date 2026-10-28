@@ -108,6 +108,10 @@ ADMIN_LOG = os.path.join(VAR_DIR, "admin.log")
 SUBSCRIPTION_FILE = os.path.join(VAR_DIR, "proxy_providers", "subscription.yaml")
 # 订阅清单（可存多个，但同一时间只有一个启用）：启用项始终落盘为 settings.conf 的 wizard_sub_*
 SUBS_FILE = os.path.join(ETC_DIR, "subscriptions.json")
+# 配置应用的进度文件（由 cmd/config_callback 写，管理服务只读）
+# 为什么用文件而不是内存：进度由「跑配置的脚本」产生，而脚本是独立进程，
+# 两者没有共享内存；文件是两者之间最简单可靠的通道。
+APPLY_PROGRESS_FILE = os.path.join(VAR_DIR, "apply.progress")
 MAX_SUBS = 30
 LEGACY_SUB_ID = "legacy"
 
@@ -475,9 +479,96 @@ def validate_settings(data):
 # 并与内核任务互斥（内核升级期间不允许改配置，反之亦然）。
 _APPLY_LOCK = threading.Lock()
 
+# ---------------------------------------------------------------- 配置应用任务
+#
+# 为什么改成「异步任务 + 轮询进度」：
+# 应用一次配置要跑十几秒到一分钟（下载订阅 → 解析 → 生成配置 → 重启内核）。
+# 过去是同步等到底才返回，前端只能显示一个转圈的按钮，用户既不知道进行到哪一步，
+# 也没法知道到底卡住了还是只是慢。
+# 现在：POST 立刻返回「已受理」，后台线程干活，进度写到 apply.progress，
+# 前端轮询 GET /api/apply/progress 就能看到「正在下载订阅信息 → 解析中 →
+# 生成配置中 → 重启内核中 → 已完成」，并用遮罩挡住其它操作。
+#
+# 状态字段：state=running|done|error|unknown，stage/percent/message 描述当前阶段。
+APPLY_TASK = {
+    "state": "unknown", "stage": "", "percent": 0, "message": "",
+    "started_at": 0, "finished_at": 0, "error": "", "result": {},
+}
+APPLY_TASK_LOCK = threading.Lock()
+
+# 进度阶段 → 展示文案。键与 config_callback 里 progress_set 的 stage 对应。
+APPLY_STAGE_TEXT = {
+    "start": "准备中",
+    "downloading": "正在下载订阅信息",
+    "parsing": "正在解析订阅内容",
+    "generating": "正在生成配置文件",
+    "saving": "正在保存配置",
+    "restarting": "正在重启内核",
+    "done": "已完成",
+    "failed": "执行失败",
+}
+
+
+def _read_apply_progress():
+    """读 config_callback 写下的进度文件。"""
+    stage, percent, message = "", 0, ""
+    try:
+        with open(APPLY_PROGRESS_FILE, encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key, val = key.strip(), val.strip()
+                if key == "stage":
+                    stage = val
+                elif key == "percent":
+                    percent = to_int(val, 0)
+                elif key == "message":
+                    message = val
+    except OSError:
+        return "", 0, ""
+    return stage, percent, message
+
+
+def apply_progress_snapshot():
+    """给前端的进度快照。"""
+    with APPLY_TASK_LOCK:
+        snap = dict(APPLY_TASK)
+    # 进度文件是「活的」，任务状态是「记账的」，两者合起来才是完整视图
+    stage, percent, message = _read_apply_progress()
+    if stage:
+        snap["stage"] = stage
+        snap["percent"] = percent
+        snap["message"] = message or APPLY_STAGE_TEXT.get(stage, stage)
+    snap["stage_text"] = APPLY_STAGE_TEXT.get(snap.get("stage", ""), snap.get("message", ""))
+    snap["running"] = snap.get("state") == "running"
+    return snap
+
+
+def apply_task_running():
+    with APPLY_TASK_LOCK:
+        return APPLY_TASK.get("state") == "running"
+
+
+def _apply_task_update(**kw):
+    with APPLY_TASK_LOCK:
+        APPLY_TASK.update(kw)
+
+
+def _apply_task_reset():
+    with APPLY_TASK_LOCK:
+        APPLY_TASK.update({
+            "state": "running", "stage": "start", "percent": 0, "message": "准备中",
+            "started_at": int(time.time()), "finished_at": 0, "error": "", "result": {},
+        })
+
 
 def apply_settings(data):
-    """写入配置并重启内核。通过 config_callback 复用既有的配置生成逻辑。"""
+    """写入配置并重启内核。通过 config_callback 复用既有的配置生成逻辑。
+
+    返回 202（已受理，异步执行）；最终结果通过 /api/apply/progress 取。
+    """
     script, tried = find_cmd_script("config_callback")
     if not script:
         return 500, missing_script_error("config_callback", tried)
@@ -486,9 +577,12 @@ def apply_settings(data):
     if not _APPLY_LOCK.acquire(blocking=False):
         return 409, {"ok": False, "error": "上一次配置变更还在执行，请稍候再试"}
     try:
+        # 注意：锁由后台线程释放（见 _apply_settings_locked 里的 _worker），
+        # 这里不能在 finally 里释放，否则并发保护形同虚设。
         return _apply_settings_locked(data, script)
-    finally:
+    except Exception:
         _APPLY_LOCK.release()
+        raise
 
 
 def _config_sig():
@@ -501,7 +595,6 @@ def _config_sig():
 
 
 def _apply_settings_locked(data, script):
-
     env = os.environ.copy()
     # 关键：重启内核时不要连带杀掉管理服务自身
     env["MIPROXY_KEEP_ADMIN"] = "1"
@@ -533,12 +626,46 @@ def _apply_settings_locked(data, script):
     cfg_before = _config_sig()
     pid_before = read_pid(MIHOMO_PID_FILE)
 
+    # 后台执行：接口立刻返回，前端轮询 /api/apply/progress 看阶段。
+    # 为什么必须异步：应用一次配置要跑十几秒到一分钟，同步等待期间用户
+    # 既看不到「进行到哪一步」，也没法判断是卡住了还是只是慢。
+    def _worker():
+        try:
+            code, body = _run_config_callback(env, script, cfg_before, pid_before)
+        except Exception as exc:  # noqa: BLE001
+            code, body = 500, {"ok": False, "error": "执行配置应用时发生异常: %s" % exc}
+        finally:
+            _APPLY_LOCK.release()
+        _apply_task_update(
+            state=("done" if code == 200 else "error"),
+            stage=("done" if code == 200 else "failed"),
+            percent=100,
+            message=(body.get("error") or "已完成") if code != 200 else "已完成",
+            error=(body.get("error") or "") if code != 200 else "",
+            finished_at=int(time.time()),
+            result={"code": code, "body": body},
+        )
+
+    _apply_task_reset()
+    threading.Thread(target=_worker, name="apply-config", daemon=True).start()
+
+    # 202 Accepted：任务已受理，结果稍后通过 /api/apply/progress 取
+    return 202, {
+        "ok": True,
+        "accepted": True,
+        "running": True,
+        "message": "配置应用已开始，进度见 /api/apply/progress",
+    }
+
+
+def _run_config_callback(env, script, cfg_before, pid_before):
+    """真正执行 config_callback 并汇总结果（跑在后台线程里）。"""
     try:
         proc = subprocess.run(
-            [bash_bin(), script], env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180,
+            [bash_bin(), script], env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
         )
     except subprocess.TimeoutExpired:
-        return 504, {"ok": False, "error": "应用配置超时（config_callback 未在 180 秒内完成）"}
+        return 504, {"ok": False, "error": "应用配置超时（config_callback 未在 300 秒内完成）"}
     except OSError as exc:
         return 500, {"ok": False, "error": "执行 config_callback 失败: %s" % exc}
 
@@ -571,6 +698,7 @@ def _apply_settings_locked(data, script):
     # 非 0 就别再返回 200：前端（以及任何直接调 API 的脚本）都该明确看到这是失败。
     # 返回码 3 是 config_callback 约定的「配置已写入但内核重启失败」，
     # 返回码 4 是「订阅没解析出任何节点」（节点没生效，且可能保留了旧配置）。
+    # 返回码 5 是「另一个配置应用正在进行」（跨进程锁没拿到）。
     if proc.returncode == 3:
         body["error"] = "配置已写入，但内核重启失败——新配置不会生效，请查看日志"
     elif proc.returncode == 4:
@@ -580,6 +708,8 @@ def _apply_settings_locked(data, script):
             diag = diag[len("订阅未解析出任何节点："):].strip()
         body["error"] = "订阅未解析出任何节点，节点不会生效%s" % (("：" + diag) if diag else "，请检查订阅链接返回的是否为 Clash/mihomo 格式")
         body["sub_nodes"] = 0
+    elif proc.returncode == 5:
+        body["error"] = "另一个配置应用正在进行，请稍后重试"
     else:
         detail = (proc.stderr or proc.stdout or "").strip().splitlines()
         body["error"] = "生成配置失败（config_callback 返回 %s）%s" % (
@@ -1745,6 +1875,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/kernel/task":
             return self._json(200, kernel_task_snapshot())
 
+        if path == "/api/apply/progress":
+            return self._json(200, apply_progress_snapshot())
+
         if path == "/api/logs":
             query = parse_qs(parsed.query)
             name = (query.get("name", ["info"])[0] or "info").strip()
@@ -1894,7 +2027,6 @@ class Handler(BaseHTTPRequestHandler):
             code, resp = apply_settings(payload)
             resp.update({"applied": True, "active_id": active_id})
             return self._json(code, resp)
-
         return self._json(404, {"error": "not found"})
 
 

@@ -22,6 +22,11 @@ if [ -f "${SCRIPT_DIR}/sub_download.sh" ]; then
     . "${SCRIPT_DIR}/sub_download.sh"
 fi
 
+# 配置生成共用库（extract_yaml_block / count_yaml_nodes / emit_config_yaml 等）
+if [ -f "${SCRIPT_DIR}/miproxy_config_lib.sh" ]; then
+    . "${SCRIPT_DIR}/miproxy_config_lib.sh"
+fi
+
 PROXY_USER="${wizard_proxy_user:-}"
 PROXY_PASS="${wizard_proxy_pass:-}"
 SECRET="${wizard_secret:-}"
@@ -37,120 +42,93 @@ log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"
 }
 
-# YAML 块提取（v7 原始逻辑 + 缩进规范化）
-# ⚠️ 与 cmd/config_callback 里的同名函数保持一致（历史 bug 多源于「只修了一份」）。
-extract_yaml_block() {
-    # 解析失败不再静默丢弃：stderr 统一写入 info.log（python3 缺失/文件不可读/语法错误均可追溯）
-    python3 - "$1" "$2" 2>>"${LOG_FILE:-/dev/null}" <<'PYEOF'
-import sys
-key = sys.argv[1] + ":"
-try:
-    with open(sys.argv[2], 'r', encoding='utf-8') as f:
-        lines = f.readlines()
-except Exception as e:
-    sys.stderr.write("[extract_yaml_block] 读取订阅缓存失败: %s (%s: %s)\n" % (sys.argv[2], type(e).__name__, e))
-    sys.exit(3)
-result = []
-found = False
-for line in lines:
-    stripped = line.rstrip('\n')
-    if not stripped.strip():
-        if found: result.append(line)
-        continue
-    is_top = not stripped[0].isspace()
-    if is_top:
-        if stripped.startswith(key):
-            found = True
-            result.append(line)
-        elif found:
-            if stripped.startswith('-'):
-                result.append(line)
-            else:
-                break
-    elif found:
-        result.append(line)
-
-
-def normalize(block):
-    """把「顶格 - 」的列表项缩进到父键下面，输出规范的 YAML 块。
-
-    为什么必须做：YAML 允许序列与父键同缩进，所以
-        proxies:
-        - name: A
-    对内核是合法的（节点能正常加载），但一堆简易解析器
-    （包括本项目早期版本的管理服务）是按「块内必须缩进」来切段的，
-    遇到顶格就认为 proxies 段结束 —— 于是订阅明明有 80 多个节点，
-    管理界面却显示 0 个，用户完全看不出问题在哪。
-    统一缩进成规范写法，两边就都对了。
-    """
-    if len(block) <= 1:
-        return block
-    body = block[1:]
-    min_indent = None
-    for l in body:
-        if not l.strip():
-            continue
-        indent = len(l) - len(l.lstrip(' '))
-        if min_indent is None or indent < min_indent:
-            min_indent = indent
-    if min_indent is None or min_indent > 0:
-        return block          # 本来就是缩进好的，不用动
-    out = [block[0]]
-    for l in body:
-        out.append(('  ' + l) if l.strip() else l.rstrip('\n'))
-    return out
-
-
-sys.stdout.write(''.join(normalize(result)))
-PYEOF
+# ============ 保留既有配置（重装 / 升级场景）============
+#
+# 为什么必须做：
+# 重装或升级 .fpk 时，fnOS 会再次执行 install_callback，而此时它带来的
+# wizard_* 是**向导的默认值**（订阅类型=none、密钥空、端口默认值……）。
+# install_callback 原本无条件整体重写 settings.conf，于是：
+#   用户首次安装选了「暂不配置」→ 之后在管理界面配好了远程订阅并跑通 →
+#   一次「更新安装」就把订阅打回 none，节点全没了，还得重新配一遍。
+# 也就是说「重装」把用户在面板里做出的配置全部抹掉了。
+#
+# 判定「用户是否显式指定过某个值」的规则：
+#   - 订阅：向导给了远程 URL，或本地路径确实存在 → 视为显式指定，用向导值；
+#     否则（向导仍是默认的 none / 空）→ 沿用既有配置。
+#   - 其余键：向导给了非默认值 → 视为显式指定；否则沿用既有配置。
+# 全新安装时不存在既有 settings.conf，直接用向导值，行为不变。
+#
+# 提示：若确实想在重装时改回默认值，安装后在管理界面改一次即可。
+OLD_SETTINGS="${TRIM_PKGETC}/settings.conf"
+old_get() {
+    [ -f "${OLD_SETTINGS}" ] || return 0
+    grep "^$1=" "${OLD_SETTINGS}" 2>/dev/null | cut -d= -f2- | tr -d '\r\n'
 }
 
-# 统计一个 YAML 文件里 proxies 段的条目数（顶格/缩进两种写法都认）
-count_yaml_nodes() {
-    python3 - "$1" 2>>"${LOG_FILE:-/dev/null}" <<'PYEOF'
-import sys
-path = sys.argv[1]
-try:
-    lines = open(path, encoding='utf-8', errors='replace').read().splitlines()
-except Exception:
-    print("0")
-    sys.exit(0)
-inblk = False
-count = 0
-for raw in lines:
-    if not inblk:
-        if raw.strip() == "proxies:":
-            inblk = True
-        continue
-    if raw and not raw[0].isspace():
-        if raw.startswith("-"):
-            count += 1
-        else:
-            break
-        continue
-    line = raw.strip()
-    if not line or line.startswith("#"):
-        continue
-    if line.startswith("-"):
-        count += 1
-print(count)
-PYEOF
-}
+if [ -f "${OLD_SETTINGS}" ]; then
+    OLD_SUB_TYPE=$(old_get wizard_sub_type)
+    OLD_SUB_URL=$(old_get wizard_sub_url)
+    OLD_SUB_PATH=$(old_get wizard_sub_path)
+    OLD_HTTP_PORT=$(old_get wizard_http_port)
+    OLD_API_PORT=$(old_get wizard_api_port)
+    OLD_TUN=$(old_get wizard_tun_enable)
+    OLD_INTERVAL=$(old_get wizard_refresh_interval)
+    OLD_PROXY_USER=$(old_get wizard_proxy_user)
+    OLD_PROXY_PASS=$(old_get wizard_proxy_pass)
+    OLD_SECRET=$(old_get wizard_secret)
+
+    # --- 订阅：向导显式给了才算数 ---
+    SUB_EXPLICIT=0
+    if [ "${SUB_TYPE}" = "remote" ] && [ -n "${SUB_URL}" ]; then
+        SUB_EXPLICIT=1
+    elif [ "${SUB_TYPE}" = "local" ] && [ -n "${SUB_PATH}" ] && [ -f "${SUB_PATH}" ]; then
+        SUB_EXPLICIT=1
+    fi
+    if [ "${SUB_EXPLICIT}" = "0" ]; then
+        if [ -n "${OLD_SUB_TYPE}" ] && [ "${OLD_SUB_TYPE}" != "none" ]; then
+            log_msg "检测到既有配置：沿用原订阅（${OLD_SUB_TYPE}），本次重装未显式指定新订阅"
+            SUB_TYPE="${OLD_SUB_TYPE}"
+            SUB_URL="${OLD_SUB_URL}"
+            SUB_PATH="${OLD_SUB_PATH}"
+        else
+            # 既有也是 none → 保持 none
+            SUB_TYPE="${OLD_SUB_TYPE:-none}"
+        fi
+    fi
+
+    # --- 其余键：向导给的是默认值时沿用既有值 ---
+    [ -z "${SUB_URL}" ] && [ -n "${OLD_SUB_URL}" ] && [ "${SUB_TYPE}" = "remote" ] && SUB_URL="${OLD_SUB_URL}"
+    [ -z "${SUB_PATH}" ] && [ -n "${OLD_SUB_PATH}" ] && [ "${SUB_TYPE}" = "local" ] && SUB_PATH="${OLD_SUB_PATH}"
+
+    [ -n "${OLD_HTTP_PORT}" ] && HTTP_PORT="${OLD_HTTP_PORT}"
+    [ -n "${OLD_API_PORT}" ] && API_PORT="${OLD_API_PORT}"
+    [ -n "${OLD_TUN}" ] && TUN_ENABLE="${OLD_TUN}"
+    [ -n "${OLD_INTERVAL}" ] && REFRESH_INTERVAL_HOURS="${OLD_INTERVAL}"
+    # 密钥/代理认证：向导留空 = 没打算改 → 沿用面板里设好的，别把密钥抹了
+    [ -z "${PROXY_USER}" ] && [ -n "${OLD_PROXY_USER}" ] && PROXY_USER="${OLD_PROXY_USER}"
+    [ -z "${PROXY_PASS}" ] && [ -n "${OLD_PROXY_PASS}" ] && PROXY_PASS="${OLD_PROXY_PASS}"
+    [ -z "${SECRET}" ] && [ -n "${OLD_SECRET}" ] && SECRET="${OLD_SECRET}"
+
+    log_msg "沿用既有配置：SUB_TYPE=${SUB_TYPE}, HTTP_PORT=${HTTP_PORT}, API_PORT=${API_PORT}"
+    log_msg "               TUN=${TUN_ENABLE}, REFRESH_INTERVAL=${REFRESH_INTERVAL_HOURS}"
+else
+    log_msg "全新安装：使用安装向导提供的配置"
+fi
+
+
+# extract_yaml_block / count_yaml_nodes 已统一到 miproxy_config_lib.sh（install_callback
+# 与 config_callback 共用）。本脚本在顶部已 source 该库，下方直接调用即可。
+
 
 
 log_msg "install_callback v11 启动"
 log_msg "  HTTP_PORT=${HTTP_PORT}, API_PORT=${API_PORT}"
 log_msg "  SUB_TYPE=${SUB_TYPE}, SUB_URL=${SUB_URL:-（空）}, SUB_PATH=${SUB_PATH:-（空）}"
 
-# 安全提取订阅域名（v9 新增）
-SUB_DOMAIN_FILTER=""
-if [ "${SUB_TYPE}" = "remote" ] && [ -n "${SUB_URL}" ]; then
-    # 使用 grep -oE 只提取合法域名格式，防止命令注入
-    domain=$(echo "${SUB_URL}" | sed -E 's|^https?://||; s|/.*$||; s|:.*$||' | grep -oE '^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$' | head -1)
-    if [ -n "${domain}" ]; then
-        log_msg "  提取订阅域名: ${domain}"
-        SUB_DOMAIN_FILTER="    - \"${domain}\"\n    - \"*.${domain}\""
-    fi
+# 安全提取订阅域名（统一库 miproxy_config_lib.sh）
+compute_domain_filter
+if [ -n "${domain}" ]; then
+    log_msg "  提取订阅域名: ${domain}"
 fi
 
 mkdir -p "${TARGET_DIR}" "${VAR_DIR}/proxy_providers" "${UI_TARGET}" "${TRIM_PKGETC}"
@@ -201,14 +179,25 @@ if [ "${SUB_TYPE}" = "remote" ] && [ -n "${SUB_URL}" ]; then
         elif [ "${rc}" = "2" ]; then
             log_msg "  ⚠️ 订阅已下载，但不是 Clash/mihomo 格式（已保留文件供诊断）"
         else
-            log_msg "  ⚠️ 订阅下载失败"
+            # 下载失败：保留上一次的缓存。
+            # 重装/升级时网络可能不通，若此时把缓存清掉，用户的节点就全没了，
+            # 而他们还得重新配置一遍 —— 正是「重装后配置丢失」的一部分。
+            if [ -f "${SUB_CACHE_PATH}" ] && [ "$(count_yaml_nodes "${SUB_CACHE_PATH}")" -gt 0 ] 2>/dev/null; then
+                log_msg "  ⚠️ 订阅下载失败，沿用上一次缓存（其中仍有可用节点）"
+            else
+                log_msg "  ⚠️ 订阅下载失败"
+            fi
         fi
     else
         if curl -fsSL --connect-timeout 15 --max-time 60 -A "clash.meta" "${SUB_URL}" -o "${SUB_CACHE_PATH}.tmp" 2>>"${DEBUG_LOG}" && [ -s "${SUB_CACHE_PATH}.tmp" ]; then
             mv "${SUB_CACHE_PATH}.tmp" "${SUB_CACHE_PATH}"
             log_msg "  ✅ 订阅下载成功: $(stat -c%s "${SUB_CACHE_PATH}" 2>/dev/null || wc -c < "${SUB_CACHE_PATH}") bytes"
         else
-            log_msg "  ⚠️ 订阅下载失败"
+            if [ -f "${SUB_CACHE_PATH}" ] && [ "$(count_yaml_nodes "${SUB_CACHE_PATH}")" -gt 0 ] 2>/dev/null; then
+                log_msg "  ⚠️ 订阅下载失败，沿用上一次缓存（其中仍有可用节点）"
+            else
+                log_msg "  ⚠️ 订阅下载失败"
+            fi
             rm -f "${SUB_CACHE_PATH}.tmp"
         fi
     fi
@@ -230,11 +219,7 @@ fi
 SUB_INLINE_NODES="${CACHE_NODES:-0}"
 
 
-# ============ v9: 完整字段同步 ============
-SUB_PROXIES=""; SUB_HOSTS=""; SUB_PG=""; SUB_RULES=""; SUB_DNS=""
-SUB_BYPASS=""; SUB_PROXY_PROVIDERS=""; SUB_RULE_PROVIDERS=""; SUB_SUB_RULE=""
-SUB_TUNNELS=""; SUB_LISTENERS=""; SUB_SNIFF=""; SUB_NTP=""; SUB_SCRIPT=""
-
+# ============ 完整字段同步（统一库 miproxy_config_lib.sh）============
 HAVE_PY3=1
 if [ -f "${SUB_CACHE_PATH}" ] && ! command -v python3 >/dev/null 2>&1; then
     HAVE_PY3=0
@@ -246,25 +231,12 @@ if [ -f "${SUB_CACHE_PATH}" ] && [ "${SUB_TYPE}" = "none" ]; then
     log_msg "未启用订阅（sub_type=none），忽略已有订阅缓存，生成默认规则配置"
 fi
 
+# 统一解析订阅字段（proxies/hosts/proxy-groups/rules/dns/扩展字段），
+# 与 config_callback 共用同一份逻辑，保证安装与改配置生成的 config 完全一致。
+extract_subscription_fields
+
+# 字段同步统计（便于日志印证，不影响生成结果）
 if [ -f "${SUB_CACHE_PATH}" ] && [ "${HAVE_PY3}" = "1" ] && { [ "${SUB_TYPE}" = "remote" ] || [ "${SUB_TYPE}" = "local" ]; }; then
-    # 基础字段
-    SUB_PROXIES=$(extract_yaml_block "proxies" "${SUB_CACHE_PATH}")
-    SUB_HOSTS=$(extract_yaml_block "hosts" "${SUB_CACHE_PATH}")
-    SUB_PG=$(extract_yaml_block "proxy-groups" "${SUB_CACHE_PATH}")
-    SUB_RULES=$(extract_yaml_block "rules" "${SUB_CACHE_PATH}")
-    SUB_DNS=$(extract_yaml_block "dns" "${SUB_CACHE_PATH}")
-    
-    # 扩展字段
-    SUB_BYPASS=$(extract_yaml_block "bypass" "${SUB_CACHE_PATH}")
-    SUB_PROXY_PROVIDERS=$(extract_yaml_block "proxy-providers" "${SUB_CACHE_PATH}")
-    SUB_RULE_PROVIDERS=$(extract_yaml_block "rule-providers" "${SUB_CACHE_PATH}")
-    SUB_SUB_RULE=$(extract_yaml_block "sub-rule" "${SUB_CACHE_PATH}")
-    SUB_TUNNELS=$(extract_yaml_block "tunnels" "${SUB_CACHE_PATH}")
-    SUB_LISTENERS=$(extract_yaml_block "listeners" "${SUB_CACHE_PATH}")
-    SUB_SNIFF=$(extract_yaml_block "sniff" "${SUB_CACHE_PATH}")
-    SUB_NTP=$(extract_yaml_block "ntp" "${SUB_CACHE_PATH}")
-    SUB_SCRIPT=$(extract_yaml_block "script" "${SUB_CACHE_PATH}")
-    
     log_msg "  📦 字段同步统计:"
     log_msg "      proxies:$(printf '%s' "${SUB_PROXIES}" | wc -l)行"
     log_msg "      hosts:$(printf '%s' "${SUB_HOSTS}" | wc -l)行"
@@ -274,12 +246,7 @@ if [ -f "${SUB_CACHE_PATH}" ] && [ "${HAVE_PY3}" = "1" ] && { [ "${SUB_TYPE}" = 
     log_msg "      bypass:$(printf '%s' "${SUB_BYPASS}" | wc -l)行"
     log_msg "      proxy-providers:$(printf '%s' "${SUB_PROXY_PROVIDERS}" | wc -l)行"
     log_msg "      rule-providers:$(printf '%s' "${SUB_RULE_PROVIDERS}" | wc -l)行"
-    
-    [ -n "${SUB_DNS}" ] && ! printf '%s' "${SUB_DNS}" | grep -q "nameserver" && SUB_DNS="" && log_msg "  ⚠️ dns 缺 nameserver，回退本地默认"
 fi
-
-# 订阅启用了却一个节点都没解析出来 —— 生成配置前先记下来，
-# 落位时据此决定「保留旧配置」还是「写入并告警」（见下方 CONFIG_TMP 处理）。
 SUB_HAS_NODES=1
 if [ "${SUB_TYPE}" = "remote" ] || [ "${SUB_TYPE}" = "local" ]; then
     SUB_PROXY_LINES=$(printf '%s' "${SUB_PROXIES}" | wc -l | tr -d ' ')
@@ -292,92 +259,10 @@ fi
 
 log_msg "生成 config.yaml..."
 
-{
-    echo "# MiProxy 主配置（v9：安全修复版）"
-    echo ""
-    echo "mixed-port: ${HTTP_PORT}"
-    echo "allow-lan: true"
-    echo "mode: rule"
-    echo "log-level: info"
-    echo "ipv6: false"
-    echo "external-controller: 0.0.0.0:${API_PORT}"
-    echo "external-ui: ${UI_TARGET}"
-    echo "external-ui-name: zashboard"
-    [ -n "${SECRET}" ] && echo "secret: \"${SECRET}\""
-    [ -n "${PROXY_USER}" ] && [ -n "${PROXY_PASS}" ] && echo "authentication:" && echo "  - \"${PROXY_USER}:${PROXY_PASS}\""
-    echo "external-controller-cors:"
-    echo "  allow-private-network: true"
-    echo "  allow-origins: [\"*\"]"
-    echo "geodata-mode: true"
-    echo "geodata-loader: memconservative"
-    echo "tun:"
-    echo "  enable: ${TUN_ENABLE}"
-    echo "  stack: mixed"
-    echo "  auto-route: true"
-    echo "  auto-redirect: true"
-    echo "  auto-detect-interface: true"
-    echo "  device: miproxy"
-    echo "  mtu: 1500"
-    echo "  dns-hijack: [\"any:53\", \"tcp://any:53\"]"
-    echo "  strict-route: true"
-    echo "  gso: true"
-    echo "  gso-max-size: 65536"
-    # 来自订阅源的字段
-    [ -n "${SUB_PROXIES}" ] && echo "# 节点列表（来自订阅源）" && echo "${SUB_PROXIES}"
-    [ -n "${SUB_HOSTS}" ] && echo "# hosts（来自订阅源）" && echo "${SUB_HOSTS}"
+# 统一生成入口（miproxy_config_lib.sh 的 emit_config_yaml），
+# 与 config_callback 共用，保证安装与改配置生成的 config 完全一致。
+emit_config_yaml
 
-    if [ -n "${SUB_PG}" ]; then
-        echo "# 代理组（来自订阅源）"
-        echo "${SUB_PG}"
-    else
-        echo "proxy-groups:"
-        echo "  - name: PROXY"
-        echo "    type: select"
-        echo "    proxies: [DIRECT, REJECT]"
-    fi
-
-    if [ -n "${SUB_RULES}" ]; then
-        echo "# 路由规则（来自订阅源）"
-        echo "${SUB_RULES}"
-    else
-        echo "rules: [\"GEOIP,CN,DIRECT\", \"MATCH,PROXY\"]"
-    fi
-
-    if [ -n "${SUB_DNS}" ]; then
-        echo "# DNS（来自订阅源）"
-        echo "${SUB_DNS}"
-    else
-        echo "dns:"
-        echo "  enable: true"
-        echo "  listen: 0.0.0.0:53"
-        echo "  enhanced-mode: fake-ip"
-        echo "  fake-ip-range: 198.18.0.1/16"
-        if [ -n "${SUB_DOMAIN_FILTER}" ]; then
-            echo "  fake-ip-filter:"
-            echo -e "    - \"+.lan\""
-            echo -e "    - \"+.local\""
-            echo -e "${SUB_DOMAIN_FILTER}"
-        else
-            echo "  fake-ip-filter:"
-            echo "    - \"+.lan\""
-            echo "    - \"+.local\""
-        fi
-        echo "  nameserver:"
-        echo "    - 223.5.5.5"
-        echo "    - 119.29.29.29"
-        echo "    - 8.8.8.8"
-    fi
-
-    [ -n "${SUB_BYPASS}" ] && echo "# bypass 私有绕过列表" && echo "${SUB_BYPASS}"
-    [ -n "${SUB_PROXY_PROVIDERS}" ] && echo "# proxy-providers 代理集合" && echo "${SUB_PROXY_PROVIDERS}"
-    [ -n "${SUB_RULE_PROVIDERS}" ] && echo "# rule-providers 规则集合" && echo "${SUB_RULE_PROVIDERS}"
-    [ -n "${SUB_SUB_RULE}" ] && echo "# sub-rule 子规则" && echo "${SUB_SUB_RULE}"
-    [ -n "${SUB_TUNNELS}" ] && echo "# tunnels 流量隧道" && echo "${SUB_TUNNELS}"
-    [ -n "${SUB_LISTENERS}" ] && echo "# listeners 监听器" && echo "${SUB_LISTENERS}"
-    [ -n "${SUB_SNIFF}" ] && echo "# sniff 嗅探" && echo "${SUB_SNIFF}"
-    [ -n "${SUB_NTP}" ] && echo "# ntp 时间同步" && echo "${SUB_NTP}"
-    [ -n "${SUB_SCRIPT}" ] && echo "# script 脚本" && echo "${SUB_SCRIPT}"
-} > "${CONFIG_TMP}"
 
 # ⚠️ 先写临时文件、回读校验节点数，再落位：
 # 「卸载保留数据 → 重新安装」时数据目录里可能还留着上一份能用的 config.yaml，
@@ -406,10 +291,15 @@ rm -f "${VAR_DIR}/base.yaml" "${VAR_DIR}/subscription.yaml" "${VAR_DIR}/subscrip
 # settings.conf 下面会整体重写，未列出的键会被丢弃。
 # wizard_admin_port / wizard_admin_token 不在向导字段里（由管理界面或手动维护），必须显式保留，
 # 否则「卸载时保留数据 → 重新安装」会把管理端口/令牌改回默认值。
-ADMIN_PORT_KEEP=""
-ADMIN_TOKEN_KEEP=""
-if [ -f "${TRIM_PKGETC}/settings.conf" ]; then
+#
+# 取值优先级：环境变量（本次显式传入）> 旧 settings.conf（之前保存的）> 空（走默认值）。
+# 只读旧文件会丢掉「本次安装显式指定的管理端口」—— 那一项就不会生效。
+ADMIN_PORT_KEEP="${wizard_admin_port:-}"
+ADMIN_TOKEN_KEEP="${wizard_admin_token:-}"
+if [ -z "${ADMIN_PORT_KEEP}" ] && [ -f "${TRIM_PKGETC}/settings.conf" ]; then
     ADMIN_PORT_KEEP=$(grep '^wizard_admin_port=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')
+fi
+if [ -z "${ADMIN_TOKEN_KEEP}" ] && [ -f "${TRIM_PKGETC}/settings.conf" ]; then
     ADMIN_TOKEN_KEEP=$(grep '^wizard_admin_token=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')
 fi
 
@@ -431,5 +321,8 @@ chmod 666 "${TRIM_PKGETC}/settings.conf" 2>/dev/null
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bash "${SCRIPT_DIR}/main" start 2>>"${DEBUG_LOG}" && log_msg "✅ miproxy 启动成功" || log_msg "⚠️  miproxy 启动失败"
+# 让刷新守护进程与最终生效的设置对齐
+# （重装时订阅类型/刷新间隔可能沿用了旧配置，main start 只看 settings.conf 决定要不要起守护进程）
+bash "${SCRIPT_DIR}/main" sync-daemon 2>>"${DEBUG_LOG}" || true
 log_msg "===== install_callback v11 完成 ====="
 exit 0
