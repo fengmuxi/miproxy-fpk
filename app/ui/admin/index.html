@@ -1254,7 +1254,9 @@
       $("nodeSubTag").textContent = (r && r.subscription) ? "· " + r.subscription : "";
       $("nodeHint").textContent = nodeState.items.length
         ? "节点清单取自 config.yaml（实际生效的那份），延迟由内核真实发请求测得，测试地址 " + (r.test_url || "") + "。"
-        : "当前 config.yaml 里没有节点——请先在「订阅」页启用一个订阅并应用。";
+        : "当前 config.yaml 里没有节点。请先在「订阅」页启用一个订阅并应用；若订阅显示已启用却仍然没有节点，"
+          + "多半是订阅链接返回的不是 Clash/mihomo 格式（常见是 base64 编码的 v2ray 链接），"
+          + "详情见「订阅」页保存时的错误提示与日志。";
       renderNodes();
     }).catch(function (e) {
       if (e.message.indexOf("未授权") < 0) toast("读取节点失败：" + e.message, "err");
