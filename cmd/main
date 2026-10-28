@@ -70,7 +70,7 @@ find_script() {
         return 0
     fi
     # 尝试标准安装路径
-    for p in "/var/packages/miproxy/cmd/${name}" "${TRIM_APPDEST}/${name}"; do
+    for p in "/var/packages/miproxy/cmd/${name}" "${TRIM_APPDEST}/${name}" "${MAIN_DIR}/${name}"; do
         if [ -f "${p}" ]; then
             echo "${p}"
             return 0
@@ -179,9 +179,57 @@ stop_refresh_daemon() {
 
 # ============ 管理服务（Web 管理界面）============
 
+# 运行期脚本的「真实来源目录」。刻意不看 ${TRIM_PKGVAR}/cmd —— 那是同步出来的
+# 副本，把它当成来源会导致「副本同步副本」自我循环、升级后永远拿不到新版本。
+find_cmd_source_dir() {
+    for d in "${TRIM_APPDEST}/cmd" "/var/apps/miproxy/cmd" "/var/packages/miproxy/cmd" "${MAIN_DIR}"; do
+        [ -n "${d}" ] || continue
+        if [ -f "${d}/main" ] && [ -f "${d}/admin_server.py" ]; then
+            echo "${d}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 把运行期脚本同步一份到数据目录（${TRIM_PKGVAR}/cmd）。
+# 为什么需要：fnOS 安装/升级时先在 /vol1/appcenter-downloads/<包名> 解包并从那里
+# 执行 install_callback，装完临时目录被清理，而由它拉起的 main / 管理服务仍指向
+# 那个已消失的路径。数据目录是唯一稳定的位置，管理服务 admin_server.py 里的
+# CMD_DIRS 也把 ${TRIM_PKGVAR}/cmd 列为候选，两边配合后「装完不重启也能用」。
+sync_cmd_scripts() {
+    local src_dir
+    src_dir=$(find_cmd_source_dir) || {
+        log_msg "警告: 未找到脚本源目录（已试 TRIM_APPDEST、/var/apps、本脚本目录），跳过脚本同步"
+        return 0
+    }
+    local dest="${TRIM_PKGVAR}/cmd"
+    mkdir -p "${dest}" 2>/dev/null
+    local name
+    for name in main admin_server.py config_callback refresh_sub; do
+        [ -f "${src_dir}/${name}" ] || continue
+        # 每次都比对内容：只在「不存在时复制」会让升级后数据目录里的旧副本一直生效
+        if ! cmp -s "${src_dir}/${name}" "${dest}/${name}" 2>/dev/null; then
+            if cp -f "${src_dir}/${name}" "${dest}/${name}" 2>/dev/null; then
+                chmod +x "${dest}/${name}" 2>/dev/null
+                log_msg "已同步 ${name} 到数据目录（来源 ${src_dir}）"
+            else
+                log_msg "警告: 同步 ${name} 到数据目录失败（来源 ${src_dir}）"
+            fi
+        fi
+    done
+}
+
 find_admin_script() {
-    for p in "${MAIN_DIR}/admin_server.py" "/var/apps/miproxy/cmd/admin_server.py" \
-             "${TRIM_APPDEST}/cmd/admin_server.py" "${TRIM_PKGVAR}/cmd/admin_server.py"; do
+    # 顺序很重要：安装/升级时 fnOS 会从 /vol1/appcenter-downloads/<包名> 里执行
+    # install_callback，它再拉 main —— 此时 ${MAIN_DIR} 指向那个临时解包目录，
+    # 装完就被系统删掉。若优先用 MAIN_DIR，管理服务就会从一个注定消失的路径启动，
+    # 之后它找 config_callback 必然失败（页面正常、一保存就报错）。
+    # 所以先认数据目录里的同步副本与 TRIM_APPDEST（真实安装目录），
+    # MAIN_DIR 放最后兜底（本地开发用）。
+    for p in "${TRIM_PKGVAR}/cmd/admin_server.py" "${TRIM_APPDEST}/cmd/admin_server.py" \
+             "/var/apps/miproxy/cmd/admin_server.py" "/var/packages/miproxy/cmd/admin_server.py" \
+             "${MAIN_DIR}/admin_server.py"; do
         [ -f "${p}" ] && { echo "${p}"; return 0; }
     done
     return 1
@@ -205,6 +253,9 @@ start_admin() {
     fi
 
     local script port
+    # 先把运行期脚本同步到数据目录，再从中挑选 —— 这样即便当前 main 是从临时的
+    # 解包目录跑起来的，管理服务也会从一个长期有效的路径启动。
+    sync_cmd_scripts
     script=$(find_admin_script) || {
         log_msg "警告: 未找到 admin_server.py，跳过管理服务"
         return 0
@@ -220,7 +271,7 @@ start_admin() {
         return 0
     fi
 
-    log_msg "启动管理服务 (端口: ${port})..."
+    log_msg "启动管理服务 (端口: ${port}, 脚本: ${script})..."
     nohup env TRIM_PKGVAR="${TRIM_PKGVAR}" TRIM_PKGETC="${TRIM_PKGETC}" TRIM_APPDEST="${TRIM_APPDEST}" \
         ADMIN_PORT="${port}" python3 "${script}" >> "${TRIM_PKGVAR}/admin.log" 2>&1 &
     local pid=$!

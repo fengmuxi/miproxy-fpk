@@ -183,7 +183,7 @@ miproxy-fpk/
 ## 9. 已知坑与待办（改动前请留意）
 
 1. **大小写冲突（已存在）**：`app/ui/images/` 同时有 `ICON_256.PNG` 与 `icon_256.png`，在 Windows（大小写不敏感）检出会互相覆盖，导致 `git status` 显示 `ICON_256.PNG` 为已修改。**不要在 Windows 上提交这个“修改”**，更不要在大小写文件系统上误删其一；根治需在源头把文件名统一。
-2. **版本字符串漂移**：`wizard/config` 的“关于”步骤已同步到 `v2.8.1`，但 `cmd/install_callback` 头部注释仍写 “sync v2.6.38”（脚本内部的 v9/v11 是自身迭代标记，不是产品版本，别混改）。改动时以 `manifest` 的 `version` 为准，并顺手同步这些文案。
+2. **版本字符串漂移**：`wizard/config` 的“关于”步骤已同步到 `v2.8.2`，但 `cmd/install_callback` 头部注释仍写 “sync v2.6.38”（脚本内部的 v9/v11 是自身迭代标记，不是产品版本，别混改）。改动时以 `manifest` 的 `version` 为准，并顺手同步这些文案。
 3. **README 引用了 `LICENSE`**，但仓库根目录实际**没有 LICENSE 文件**——若需合规发布应补上。
 4. **强依赖 `python3`**：`extract_yaml_block` 用 python3 解析订阅 YAML。fnOS 环境须自带 python3，否则安装会静默失败（heredoc 带 `2>/dev/null`）。
 5. **root 权限**：`config/privilege` 声明 `run-as: root`，TUN 必需；改权限相关要确认目标环境。
@@ -211,6 +211,7 @@ miproxy-fpk/
 27. **节点清单要解析 `config.yaml`，不要读订阅缓存**：缓存里有节点 ≠ 内核加载了节点（节点是内嵌进 `config.yaml` 的，见 §9.11）。节点页若图省事去读 `proxy_providers/subscription.yaml`，「订阅启用了但配置没生效」这个最常见的故障就会被它掩盖成「一切正常」。同理，延迟的初值只能来自内核 `history`（可能很旧），页面上要说清「测速才是现测」，否则用户会拿几天前的数字判断节点死活。
 28. **访问内核控制端口用 `config.yaml` 的 `secret`，不是 `wizard_secret`**：`wizard_secret` 是「期望值」，`config.yaml` 的 `secret` 是「内核实际生效值」。用户改了面板密钥但没重新应用配置时两者不一致，按设置项去请求必然 401 → 节点页整页 `unauthorized`，看起来像内核坏了。`_mihomo_secret()` 因此优先读 `config.yaml`，读不到才退回设置项。另外调内核 API 时必须 `ProxyHandler({})` 显式禁掉环境变量里的 `http_proxy`：目标是 `127.0.0.1`，走代理只会绕一圈失败；测速超时内核返回 **408** 且 body 里有 `{"message":...}`，这是有效信息，别当异常吞掉。
 29. **并发测速要设上限**：`test_nodes()` 用 `ThreadPoolExecutor(max_workers=6)`，单个 4 秒超时，单批最多 300 个。要是不限并发，一个 500 节点的订阅点「全部测速」会瞬间打满文件描述符和内核连接数，连正常上网都受影响。单点失败只影响该节点（`results[name].error`），不能让一个超时把整批拖垮。
+30. **`__file__` 不可信：脚本可能正从「装完就会被删的临时目录」里运行**。fnOS 安装/升级的链路是 `/vol1/appcenter-downloads/<包名>`（解包临时目录）→ 执行 `install_callback` → 拉起 `main` → 拉起 `admin_server.py`。装完临时目录被系统清理，进程却还活着（代码已在内存、静态页从数据目录读），于是 `admin_server.py` 里 `os.path.dirname(__file__)` 指向了一个已消失的路径，**所有 `os.path.isfile(CMD_DIR/xxx)` 全部失败**。现象极具迷惑性：页面、状态、订阅清单都正常，一点保存就报「找不到 config_callback 脚本」，而更早的版本还会把它当成「保存成功但没生效」。现在有两道防线：①`main` 的 `sync_cmd_scripts()` 每次启动把 `main` / `admin_server.py` / `config_callback` / `refresh_sub` 按内容比对同步到 `${TRIM_PKGVAR}/cmd/`，`find_admin_script()` 优先从那里启动；②`admin_server.find_cmd_script()` 按「数据目录 → 安装目录 → `/var/apps` → `/var/packages` → `__file__`」依次探测，报错时把查过的目录全部列出。**新增任何「按脚本自身位置找兄弟脚本」的代码，都不要只写 `os.path.join(os.path.dirname(__file__), ...)`。** 判据是「这个路径现在还能用吗」；「它是不是我的邻居」并不构成理由。
 
 ---
 

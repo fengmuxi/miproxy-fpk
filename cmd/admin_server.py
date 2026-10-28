@@ -55,6 +55,51 @@ APP_DEST = os.environ.get("TRIM_APPDEST") or os.path.dirname(CMD_DIR)
 VAR_DIR = os.environ.get("TRIM_PKGVAR") or os.path.join(APP_DEST, "var")
 ETC_DIR = os.environ.get("TRIM_PKGETC") or os.path.join(APP_DEST, "etc")
 
+# 生命周期脚本（config_callback / refresh_sub / main）所在的目录候选。
+# ⚠️ 绝不能只认 __file__ 的兄弟目录：fnOS 安装/升级时会先在
+# /vol1/appcenter-downloads/<包名> 里解包，并从那里执行 install_callback，
+# 它再拉起 main、main 再拉起本服务，于是 __file__ 指向的就是那个临时目录。
+# 装完临时目录被系统清理，进程却还活着（代码已在内存、静态页在数据目录），
+# 此时所有 os.path.isfile(__file__ 兄弟) 都会失败——现象是「页面一切正常，
+# 一保存就报找不到 config_callback 脚本」，直到手动重启应用才好。
+# 所以这里按「真实安装目录 → 数据目录 → __file__ → 常见布局」依次探测。
+CMD_DIRS = [
+    os.path.join(APP_DEST, "cmd"),
+    os.path.join(VAR_DIR, "cmd"),
+    CMD_DIR,
+    "/var/apps/miproxy/cmd",
+    "/var/packages/miproxy/cmd",
+]
+
+
+def find_cmd_script(name):
+    """在候选目录里找一个 cmd 脚本，返回 (路径或 None, 已查找过的目录列表)。"""
+    tried = []
+    for raw in CMD_DIRS:
+        if not raw:
+            continue
+        folder = os.path.abspath(raw)
+        if folder in tried:
+            continue
+        tried.append(folder)
+        path = os.path.join(folder, name)
+        if os.path.isfile(path):
+            return path, tried
+    return None, tried
+
+
+def missing_script_error(name, tried):
+    """脚本找不到时的统一报错：把查过哪些目录摊开，别让人靠猜。"""
+    return {
+        "ok": False,
+        "searched": tried,
+        "error": "找不到 %s 脚本（已查找：%s）。常见原因是应用刚安装/升级完，"
+                 "管理服务仍从系统的临时解包目录运行、而该目录已被清理——"
+                 "到 fnOS 应用中心把 MiProxy 重启一次即可恢复正常。"
+                 % (name, "、".join(tried)),
+    }
+
+
 SETTINGS_FILE = os.path.join(ETC_DIR, "settings.conf")
 CONFIG_FILE = os.path.join(VAR_DIR, "config.yaml")
 PID_FILE = os.path.join(VAR_DIR, "admin.pid")
@@ -407,9 +452,9 @@ _APPLY_LOCK = threading.Lock()
 
 def apply_settings(data):
     """写入配置并重启内核。通过 config_callback 复用既有的配置生成逻辑。"""
-    script = os.path.join(CMD_DIR, "config_callback")
-    if not os.path.isfile(script):
-        return 500, {"ok": False, "error": "找不到 config_callback 脚本: %s" % script}
+    script, tried = find_cmd_script("config_callback")
+    if not script:
+        return 500, missing_script_error("config_callback", tried)
     if kernel_task_running():
         return 409, {"ok": False, "error": "内核任务（升级/切换/回滚）正在进行，请稍候再修改配置"}
     if not _APPLY_LOCK.acquire(blocking=False):
@@ -511,9 +556,9 @@ def _apply_settings_locked(data, script):
 
 def do_refresh():
     """立即执行一次订阅刷新（复用 refresh_sub 的 once 模式）。"""
-    script = os.path.join(CMD_DIR, "refresh_sub")
-    if not os.path.isfile(script):
-        return 500, {"ok": False, "error": "找不到 refresh_sub 脚本: %s" % script}
+    script, tried = find_cmd_script("refresh_sub")
+    if not script:
+        return 500, missing_script_error("refresh_sub", tried)
     if kernel_task_running():
         return 409, {"ok": False, "error": "内核任务（升级/切换/回滚）正在进行，请稍候再刷新订阅"}
     if not _APPLY_LOCK.acquire(blocking=False):
@@ -1252,9 +1297,9 @@ def _restart_kernel():
     存活判定统一走 `main status`：pid 文件的语义由 main 自己维护
     （Linux 上是真实 pid，本地 Windows 调试时是 MSYS pid），不要在这里另算。
     """
-    main_script = os.path.join(CMD_DIR, "main")
-    if not os.path.isfile(main_script):
-        raise KernelError("找不到 cmd/main，无法重启内核")
+    main_script, tried = find_cmd_script("main")
+    if not main_script:
+        raise KernelError("找不到 cmd/main，无法重启内核（已查找：%s）" % "、".join(tried))
     env = os.environ.copy()
     env["MIPROXY_KEEP_ADMIN"] = "1"
     try:

@@ -175,6 +175,7 @@
 - 管理页访问内核控制端口（读节点、测速、取版本）时用的密钥，取的是 **`config.yaml` 里的 `secret`**——那是内核真正在用的那份。若你改了面板密钥但没重新应用配置，两者会不一致，此时按设置项去请求只会拿到 401、节点页整页显示 `unauthorized`；以内核实际配置为准可以避开这个坑。
 - 鉴权令牌保存在浏览器 `localStorage`，换浏览器/清缓存需重新输入。
 - 管理服务由 `cmd/main` 在应用启动时拉起（`admin.pid` / `admin.log`），与内核相互独立：内核挂掉时管理页依然可用，方便排查。
+- **运行期脚本会同步一份到数据目录**（`/vol1/@appdata/miproxy/cmd/`），管理服务优先用这份。原因见下面这条：安装/升级时 fnOS 先在 `/vol1/appcenter-downloads/<包名>` 解包并从中执行回调，装完该目录被清理；若管理服务仍从那里取脚本，就会「页面正常、一保存就报找不到 config_callback」。同步副本与安装目录每次启动比对内容，升级后不会用到旧版本。
 
 > 🔐 管理接口未设密钥时对局域网开放，请勿将 9091 直接暴露到公网；建议在向导设置面板密钥，或仅在可信内网使用。
 
@@ -289,14 +290,6 @@ TUN 需 root（已声明），网卡名固定 `miproxy`；检查 `config.yaml` �
 - **没设过密钥却不能保存（403，提示"未设置面板密钥"）**：这是安全策略——管理服务监听 `0.0.0.0`，没有密钥时等于局域网内任何人都能改配置、甚至通过「内核」页装一个任意二进制并以 root 运行，所以**未设密钥时只读、禁止一切写操作**。到 fnOS 应用中心 → MiProxy → 设置 →「面板密钥」填一个值并保存，再回管理页点顶部的「连接」即可。
 - 页面空白：浏览器强制刷新（Ctrl+F5）清缓存，管理页为单文件 HTML，无外部依赖。
 
-### Q9：节点页是空的 / 全部显示「超时」/ 显示 `unauthorized`？
-
-按这三条依次看：
-
-1. **一个节点都没有** → `config.yaml` 里确实没有 `proxies`。去「订阅」页确认已启用某条订阅并应用；只是保存了订阅、没点应用，配置不会重生成。
-2. **有节点但全部「超时」** → 先看「概览」页内核是否在运行（未运行会直接提示无法测速）；内核正常则多为节点本身失联，或 NAS 出网被拦（测速走的是内核自己的代理链路，不是管理服务的网络）。
-3. **全部显示 `unauthorized`** → 管理页访问内核控制端口的密钥与 `config.yaml` 里的 `secret` 不一致。当前版本已改为直接读 `config.yaml` 的 `secret`，通常不会再出现；若仍是，检查 `config.yaml` 是否被手工改过 `secret` 而后台服务又在读另一份。
-
 ### Q9：能同时启用多个订阅吗？
 
 不能，也不建议——MiProxy 的设计是**清单可多个、生效只有一个**：订阅清单保存在 `subscriptions.json`，但生效项会写进 `settings.conf` 的 `wizard_sub_*`，内核与刷新守护进程只读这两处。需要换订阅时在管理界面点选另一条的单选即可，旧的订阅配置会原样保留，随时切回。
@@ -315,6 +308,20 @@ TUN 需 root（已声明），网卡名固定 `miproxy`；检查 `config.yaml` �
 ### Q11：升级了 .fpk 应用包，内核会被换回去吗？
 
 不会。安装/升级回调只在 `target/mihomo` **不存在**时用内置内核补齐；已存在时只把内置版本另存为 `target/mihomo.bundled`，并在 `info.log` 记录「保留当前版本」。想换回内置内核请用「恢复内置内核」，避免"手动升级的内核被悄悄覆盖"。
+
+### Q12：节点页是空的 / 全部显示「超时」/ 显示 `unauthorized`？
+
+按这三条依次看：
+
+1. **一个节点都没有** → `config.yaml` 里确实没有 `proxies`。去「订阅」页确认已启用某条订阅并应用；只是保存了订阅、没点应用，配置不会重生成。
+2. **有节点但全部「超时」** → 先看「概览」页内核是否在运行（未运行会直接提示无法测速）；内核正常则多为节点本身失联，或 NAS 出网被拦（测速走的是内核自己的代理链路，不是管理服务的网络）。
+3. **全部显示 `unauthorized`** → 管理页访问内核控制端口的密钥与 `config.yaml` 里的 `secret` 不一致。当前版本已改为直接读 `config.yaml` 的 `secret`，通常不会再出现；若仍是，检查 `config.yaml` 是否被手工改过 `secret` 而后台服务又在读另一份。
+
+### Q13：保存配置时提示「找不到 config_callback 脚本：/vol1/appcenter-downloads/miproxy-xxx/cmd/config_callback」？
+
+这是 **v2.8.1 及更早版本**的已知问题：fnOS 安装/升级时会先在 `/vol1/appcenter-downloads/<包名>` 解包、并从那里执行安装回调，回调再拉起管理服务；装完这个临时目录被系统清理，但进程还在（代码已在内存、页面从数据目录读），于是它按脚本自身位置去找 `config_callback` 就找不到了。表现就是「页面一切正常，一保存就报错」。
+
+**临时解决**：到 fnOS 应用中心把 MiProxy 重启一次（或升级到 v2.8.2 及以后）。**v2.8.2 起**已从两个方向修死：运行期脚本会同步一份到 `/vol1/@appdata/miproxy/cmd/` 并优先使用；脚本查找也会依次尝试安装目录、数据目录、`/var/apps`、`/var/packages`，不再只看脚本自己所在的目录。若仍报此错，报错信息里会把查过的目录全部列出，按图索骥即可。
 
 ---
 
@@ -541,7 +548,7 @@ git push origin v2.8.1
 >   -H "Authorization: Bearer $GITHUB_TOKEN" \
 >   -H "Accept: application/vnd.github+json" \
 >   https://api.github.com/repos/<owner>/<repo>/actions/workflows/build-release.yml/dispatches \
->   -d '{"ref":"main","inputs":{"version":"2.8.1"}}'
+>   -d '{"ref":"main","inputs":{"version":"2.8.2"}}'
 > ```
 >
 > 用 API 触发时请让 `version` 与 tag 保持一致。另外若 tag 已经指向 HEAD，`changes` 作业的 `git diff` 为空，Release 正文的「变更详情」会是空白，需要手工补写。
@@ -611,6 +618,10 @@ changes ──┬─→ build-x86 ──┐
 ---
 
 ## 更新日志
+
+### v2.8.2
+- 🐛 修复（重要）：**安装/升级完保存配置报「找不到 config_callback 脚本」**。fnOS 会先在 `/vol1/appcenter-downloads/<包名>` 解包并从中执行安装回调，回调拉起 `main`、`main` 再拉起管理服务，于是管理服务的脚本目录指向那个**装完就会被清理**的临时目录；进程还在，页面照常显示，但一切脚本查找都失败——表现正是「页面正常、一保存就报错」，而 v2.8.1 之前它还会被误当成「配置没生效」。现在运行期脚本（`main` / `admin_server.py` / `config_callback` / `refresh_sub`）在每次启动时比对同步到 `/vol1/@appdata/miproxy/cmd/`，管理服务优先从那里启动；同时脚本查找改为依次尝试「数据目录 → 安装目录 → `/var/apps` → `/var/packages` → 脚本自身目录」，不再只认 `__file__` 的兄弟目录
+- 🐛 修复：找不到脚本时的报错只给一个路径，看不出问题在哪。现在会把**查过的所有目录**列出来，并直接给出「重启应用」的处置建议（`/api/settings` / `/api/refresh` 返回体里还带 `searched` 数组）
 
 ### v2.8.1
 - 🐛 修复：**「保存显示成功、配置其实没生效」**。`config_callback` 过去无论内核重启成功与否都 `exit 0`，而 `/api/settings`、`/api/subscriptions` 又是 HTTP 200 + `ok:false`，前端只看 HTTP 状态就把失败当成功提示了。现在 `config_callback` 在内核重启失败时返回 **3**，接口改为返回 **500** 并带上 `config_updated` / `kernel_restarted` / `returncode` 三个独立事实，页面上直接说清「配置写没写进去」「内核有没有换进程」，失败时把 `info.log` 尾部摊在订阅页里
