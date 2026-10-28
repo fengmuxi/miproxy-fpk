@@ -5,9 +5,9 @@
 # - os_max_version: 空值表示暂无明确兼容上限；填写具体版本表示最高兼容版本
 
 appname               = miproxy
-version               = 2.8.2
+version               = 2.8.3
 display_name          = MiProxy
-desc                  = MiProxy v2.8.2 - 飞牛 NAS 代理网关：一键 TUN 全局代理 + 在线管理界面（含节点测速） + 订阅自动刷新 + 内核在线升级 + 双控制面板 + DNS 防泄露，基于 mihomo 内核（仅支持 Clash 格式订阅）
+desc                  = MiProxy v2.8.3 - 飞牛 NAS 代理网关：一键 TUN 全局代理 + 在线管理界面（含节点测速） + 订阅自动刷新 + 内核在线升级 + 双控制面板 + DNS 防泄露，基于 mihomo 内核（仅支持 Clash 格式订阅）
 platform              = all
 source                = thirdparty
 os_min_version        = 1.1.0
@@ -22,4 +22,4 @@ startup               = true
 service_port          = 9090
 desktop_uidir         = ui
 desktop_applaunchname = miproxy.dashboard
-changelog           = v2.8.2: 修复安装/升级后保存配置报「找不到 config_callback 脚本」（运行期脚本同步到数据目录 + 多目录探测，不再依赖会被清理的临时解包目录）+ 报错列出已查找目录 | v2.8.1: 管理界面新增「节点」页（节点清单 + 单个/全部测速 + 延迟着色）+ 修复「配置显示成功却没生效」+ 修复 fnOS 桌面窗口内顶部菜单无法切换页面 + 访问内核控制端口改用 config.yaml 的实际密钥 | v2.8.0: 新增在线管理界面（订阅/代理/日志/内核）+ mihomo 内核检查更新与一键升级回滚 + 未设面板密钥时管理接口改只读 + 安全与健壮性修复 | v2.7.0: 全面代码审查 + 日志模块重构 + TUN 配置优化 | v2.6.39: TUN 配置优化（strict-route防DNS泄露 + gso性能 + miproxy网卡名）+ 修复订阅解析 bug | v2.6.38: 优化订阅解析逻辑
+changelog           = v2.8.3: Zashboard / MetaCubeXD 左下角新增「‹ 面板」悬浮按钮，可从第三方面板一键返回面板选择页 | v2.8.2: 修复安装/升级后保存配置报「找不到 config_callback 脚本」（运行期脚本同步到数据目录 + 多目录探测，不再依赖会被清理的临时解包目录）+ 报错列出已查找目录 | v2.8.1: 管理界面新增「节点」页（节点清单 + 单个/全部测速 + 延迟着色）+ 修复「配置显示成功却没生效」+ 修复 fnOS 桌面窗口内顶部菜单无法切换页面 + 访问内核控制端口改用 config.yaml 的实际密钥 | v2.8.0: 新增在线管理界面（订阅/代理/日志/内核）+ mihomo 内核检查更新与一键升级回滚 + 未设面板密钥时管理接口改只读 + 安全与健壮性修复 | v2.7.0: 全面代码审查 + 日志模块重构 + TUN 配置优化 | v2.6.39: TUN 配置优化（strict-route防DNS泄露 + gso性能 + miproxy网卡名）+ 修复订阅解析 bug | v2.6.38: 优化订阅解析逻辑
