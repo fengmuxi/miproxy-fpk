@@ -501,14 +501,14 @@ git push origin main        # 只推代码，不出包
 
 ```bash
 # ① 先把版本号写进 manifest（构建产物里的版本最终以它 / tag 为准）
-#    version               = 2.7.1
+#    version               = 2.8.1
 git add manifest
-git commit -m "chore: bump version to 2.7.1"
+git commit -m "chore: bump version to 2.8.1"
 git push origin main
 
 # ② 打 tag 并推送 —— 这一步才会触发构建
-git tag v2.7.1
-git push origin v2.7.1
+git tag v2.8.1
+git push origin v2.8.1
 ```
 
 版本号解析优先级：**手动输入的 `version` > tag 名（去掉 `v`）> `manifest` 里的值**。所以打 tag 时请让 tag 与 `manifest` 一致，否则源码里的版本号会落后于产物，下次手动构建容易退版本。
@@ -580,6 +580,9 @@ changes ──┬─→ build-x86 ──┐
 ## 更新日志
 
 ### 未发布（Unreleased）
+- 暂无
+
+### v2.8.0
 - 🔒 **安全修复（重要）**：管理服务在**未设置面板密钥**时完全没有鉴权，而它监听 `0.0.0.0`，且「内核」页会下载/读取二进制并以 root 运行——局域网内任何人可改配置，甚至通过「改下载源 + 安装」组合执行任意二进制。现在**无密钥时只读放行、所有写操作返回 403**，页面顶部给出「去 fnOS 设置里填面板密钥」的引导；密钥校验改用恒定时间比较
 - 🐛 修复：卸载前的 `pkill -f mihomo` 会误杀同机其它代理应用（改为只匹配本应用内核路径）
 - 🐛 修复：卸载「删除全部数据」缺少路径校验（`TRIM_*` 被误设成卷根目录会删空整卷），现在只删路径含 `miproxy` 的目录
