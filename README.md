@@ -541,7 +541,7 @@ git push origin v2.8.1
 >   -H "Authorization: Bearer $GITHUB_TOKEN" \
 >   -H "Accept: application/vnd.github+json" \
 >   https://api.github.com/repos/<owner>/<repo>/actions/workflows/build-release.yml/dispatches \
->   -d '{"ref":"main","inputs":{"version":"2.8.0"}}'
+>   -d '{"ref":"main","inputs":{"version":"2.8.1"}}'
 > ```
 >
 > 用 API 触发时请让 `version` 与 tag 保持一致。另外若 tag 已经指向 HEAD，`changes` 作业的 `git diff` 为空，Release 正文的「变更详情」会是空白，需要手工补写。
@@ -612,7 +612,7 @@ changes ──┬─→ build-x86 ──┐
 
 ## 更新日志
 
-### 未发布（Unreleased）
+### v2.8.1
 - 🐛 修复：**「保存显示成功、配置其实没生效」**。`config_callback` 过去无论内核重启成功与否都 `exit 0`，而 `/api/settings`、`/api/subscriptions` 又是 HTTP 200 + `ok:false`，前端只看 HTTP 状态就把失败当成功提示了。现在 `config_callback` 在内核重启失败时返回 **3**，接口改为返回 **500** 并带上 `config_updated` / `kernel_restarted` / `returncode` 三个独立事实，页面上直接说清「配置写没写进去」「内核有没有换进程」，失败时把 `info.log` 尾部摊在订阅页里
 - 🐛 修复：启用订阅后若**一个节点都没提取到**（订阅是 base64 格式、或下载到的是错误页），页面会明确告警，不再静默显示「已生效」
 - 🐛 修复：上一次配置还在应用时再点「启用」，单选按钮会停在用户点的位置造成「已启用」的假象；现在会提示并回到服务端真实状态
