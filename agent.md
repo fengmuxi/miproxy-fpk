@@ -203,6 +203,8 @@ miproxy-fpk/
 22. **本机 `~/.gitconfig` 里有一行空的 `credential.helper=`**，它会把系统级的 `manager` 清空，导致所有 `git push` 报 `could not read Username for 'https://github.com': terminal prompts disabled`（明明 Windows 凭据管理器里就有 `git:https://github.com`）。不要改用户的全局配置，用命令级覆盖：`git -c credential.helper=manager push ...`；需要 token 调 API 时同理 `git -c credential.helper=manager credential fill`。
 23. **顶部菜单切页不要依赖 hash**：fnOS 桌面窗口是壳程序里的 webview，`<a href="#/x">` 这次同文档导航可能被壳拦掉（`will-navigate` / `did-start-navigation` 里 `preventDefault`），于是 hash 不变 → `hashchange` 不触发 → 菜单点了毫无反应，而页面其它 JS 一切正常（概览数据照常渲染，很能骗人）。现在的做法：`_view` 内存态是唯一真相，`showView(name, syncHash)` 先切 DOM 再尽力同步 hash，点击监听挂 `document` 捕获阶段；**`route()` 只重渲染 `_view`，绝不能回读 hash**，否则受限环境里点「连接」会被旧 hash 弹回概览。
 24. **`/api/status` 的 `panel_port`** 来自 `settings.conf` 的 `wizard_api_port`（mihomo 控制端口，面板页 `external-ui` 挂在它的 `/ui/`）。新加需要跨端口跳转的入口时复用它，别再往 HTML 里写死 9090/9091。
+25. **`config_callback` 的退出码是「是否真的生效」的唯一凭据**：它过去不管内核重启成败都 `exit 0`，于是「配置已保存」和「配置没生效」在接口层长得一模一样——这就是「界面上启用了订阅、config.yaml 却没生效」的根。现在内核重启失败会返回 **3**，`_apply_settings_locked` 据此返回 500 并附 `config_updated` / `kernel_restarted` / `kernel_pid_before|after` 三个事实。**新增任何调用 config_callback 的路径，都必须检查返回码，不能只看有没有报错输出。** 另外 `MIPROXY_NO_RESTART=1`（refresh_sub 定时刷新用）仍然 `exit 0`，因为重启由调用方负责。
+26. **前端判断「应用成功」不能只看 HTTP 状态**：`applyVerdict()` 会依次看 `ok` → `config_updated` → `kernel_restarted`。只改 DOM 提示而不核对这三项，就会出现「页面说已启用了、节点其实一个都没进去」的假成功。
 
 ---
 

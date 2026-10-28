@@ -134,6 +134,9 @@
   .banner input{max-width:260px;display:inline-block;margin:0 8px;padding:7px 10px;background:#fff}
   .err-list{color:var(--err);font-size:13px;margin-top:8px}
   .err-list li{margin-left:18px}
+  /* 应用配置失败时直接摊开 info.log 尾部，省得用户再跑一趟 NAS 捞日志 */
+  .apply-log{max-height:220px;overflow:auto;margin:8px 0 0;padding:10px 12px;border-radius:9px;
+             background:#0f1115;color:#cfd3e1;font-size:12px;line-height:1.55;white-space:pre-wrap}
 
   /* 内核 */
   .kgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px 18px;margin-bottom:14px}
@@ -624,9 +627,47 @@
     });
   }
 
+  // 把「应用配置」的结果翻成人话。后端会回三个独立事实，不能只看 HTTP 200：
+  //   ok               —— config_callback 的退出码
+  //   config_updated   —— config.yaml 到底有没有被重写
+  //   kernel_restarted —— 内核有没有换新进程（没换就还在跑旧配置）
+  function applyVerdict(r) {
+    if (!r) return { level: "err", text: "没有收到返回结果" };
+    if (r.ok === false) {
+      return { level: "err", text: r.error || ("生成配置失败（返回码 " + r.returncode + "）") };
+    }
+    if (r.config_updated === false) {
+      return { level: "err", text: "已提交，但 config.yaml 没有被重写——配置没有生效，请查看下面的日志" };
+    }
+    if (r.kernel_restarted === false) {
+      return { level: "err", text: "config.yaml 已更新，但内核没有重启，新配置不会生效" };
+    }
+    return { level: "ok", text: "" };
+  }
+
+  function showApplyLog(log) {
+    if (!log) return;
+    var box = $("subErr");
+    if (box) box.innerHTML = '<pre class="apply-log">' + esc(log) + "</pre>";
+  }
+
+  // config_callback 的日志里有「proxies:N行」，拿它当"配置里到底有没有节点"的凭据。
+  // 提取到 0 行通常意味着订阅不是 Clash 格式（base64 订阅、或下载到的是错误页）。
+  // 注意取**最后一次**出现：日志是 info.log 的尾部，前面可能还留着上一次应用的统计。
+  function nodeLinesFromLog(log) {
+    var re = /proxies:\s*(\d+)\s*行/g;
+    var m, last = null;
+    while ((m = re.exec(log || "")) !== null) last = m;
+    return last ? parseInt(last[1], 10) : null;
+  }
+
   function postSubs(items, activeId, okMsg) {
     if (state.subBusy) {
-      toast("正在应用配置，请稍候…", "err");
+      // 上一次 config_callback 还在跑（它要重启内核，通常十几秒）。
+      // 这时后端会 409 或前端直接拦下，但单选按钮已经在 DOM 上被勾选了，
+      // 必须回到服务端真相，否则用户会以为「已经启用」。
+      toast("上一次配置还在应用中，请等它完成再操作", "err");
+      loadSubs();
       return Promise.reject(new Error("busy"));
     }
     state.subBusy = true;
@@ -635,11 +676,21 @@
       method: "POST",
       body: JSON.stringify({ items: items, active_id: activeId })
     }).then(function (r) {
-      if (r.applied) {
-        toast(r.mihomo_running === false
-          ? "已启用并写入配置；内核未运行，请查看日志"
-          : (okMsg || "已保存"), r.ok ? "ok" : "");
-        if (r.log) $("logView").textContent = r.log;
+      var v = applyVerdict(r);
+      if (v.level === "err") {
+        toast(v.text, "err");
+        showApplyLog(r.log);
+      } else if (r.applied && activeId) {
+        // 启用订阅时，必须确认配置里真的抽出了节点，否则「已生效」也是空配置
+        var n = nodeLinesFromLog(r.log);
+        if (n === 0) {
+          toast("配置已生成，但没有从订阅里提取到任何节点——请确认订阅是 Clash 格式", "err");
+          showApplyLog(r.log);
+        } else {
+          toast((okMsg || "已应用") + (n ? "（节点 " + n + " 行）" : ""), "ok");
+        }
+      } else if (r.applied) {
+        toast(okMsg || "已应用", "ok");
       } else {
         toast(okMsg || "已保存", "ok");
       }
@@ -647,11 +698,14 @@
       loadSubs(); loadStatus(); loadSettings();
       return r;
     }).catch(function (e) {
-      toast("保存订阅失败：" + e.message, "err");
+      // 后端给了完整原因（如「配置已写入，但内核重启失败」）就直接用，别再套一层前缀
+      toast((e.body && e.body.error) ? e.message : ("保存订阅失败：" + e.message), "err");
       if (e.body && e.body.errors) {
         $("subErr").innerHTML = e.body.errors.map(function (x) { return "<li>" + esc(x) + "</li>"; }).join("");
+      } else if (e.body && e.body.log) {
+        showApplyLog(e.body.log);
       }
-      loadSubs();
+      loadSubs();   // 失败也要回到服务端真相，别让页面显示假的「已启用」
       throw e;
     }).finally(function () {
       state.subBusy = false;
@@ -798,14 +852,20 @@
     var p = payload();
     api("/api/settings", { method: "POST", body: JSON.stringify(p) }).then(function (r) {
       if (p.secret) setToken(p.secret);
-      toast(r.mihomo_running ? "配置已保存，内核已重启" : "配置已保存；内核未运行，请查看日志", r.mihomo_running ? "ok" : "");
       if (r.log) $("logView").textContent = r.log;
+      var v = applyVerdict(r);
+      if (v.level === "err") {
+        toast(v.text, "err");
+      } else {
+        toast(r.mihomo_running ? "配置已保存，内核已重启" : "配置已保存；内核未运行，请查看日志", r.mihomo_running ? "ok" : "");
+      }
       loadStatus(); loadSettings(); loadSubs();
     }).catch(function (e) {
-      toast("保存失败：" + e.message, "err");
+      toast((e.body && e.body.error) ? e.message : ("保存失败：" + e.message), "err");
       if (e.body && e.body.errors) {
         $("errList").innerHTML = e.body.errors.map(function (x) { return "<li>" + esc(x) + "</li>"; }).join("");
       }
+      if (e.body && e.body.log) $("logView").textContent = e.body.log;
     }).finally(function () {
       btn.disabled = false;
       btn.textContent = label;

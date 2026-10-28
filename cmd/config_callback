@@ -287,7 +287,15 @@ if [ "${MIPROXY_NO_RESTART:-0}" = "1" ]; then
 else
     bash "${SCRIPT_DIR}/main" stop 2>>"${LOG_FILE}" || true
     sleep 2
-    bash "${SCRIPT_DIR}/main" start 2>>"${LOG_FILE}" && log_msg "✅ miproxy 重启成功" || log_msg "⚠️  miproxy 重启失败"
+    if bash "${SCRIPT_DIR}/main" start 2>>"${LOG_FILE}"; then
+        log_msg "✅ miproxy 重启成功"
+    else
+        # 重启失败必须让调用方感知：config.yaml 已经写好了，但内核还在跑旧配置（或根本没起来），
+        # 这时候「保存成功」是假象 —— 管理界面会据此提示「配置已写入但内核未重启」。
+        log_msg "⚠️  miproxy 重启失败：config.yaml 已写入，但内核仍是旧配置或未运行"
+        log_msg "===== config_callback v7 完成（重启失败）====="
+        exit 3
+    fi
 fi
 log_msg "===== config_callback v7 完成 ====="
 exit 0

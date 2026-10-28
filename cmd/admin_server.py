@@ -419,6 +419,15 @@ def apply_settings(data):
         _APPLY_LOCK.release()
 
 
+def _config_sig():
+    """config.yaml 的 (mtime_ns, size)，用来判断这次应用到底有没有真的重写配置。"""
+    try:
+        st = os.stat(CONFIG_FILE)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (0, 0)
+
+
 def _apply_settings_locked(data, script):
 
     env = os.environ.copy()
@@ -449,6 +458,9 @@ def _apply_settings_locked(data, script):
     env["wizard_secret"] = secret
     env["wizard_tun_enable"] = "true" if data.get("tun_enable") else "false"
 
+    cfg_before = _config_sig()
+    pid_before = read_pid(MIHOMO_PID_FILE)
+
     try:
         proc = subprocess.run(
             [bash_bin(), script], env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180,
@@ -458,15 +470,42 @@ def _apply_settings_locked(data, script):
     except OSError as exc:
         return 500, {"ok": False, "error": "执行 config_callback 失败: %s" % exc}
 
-    running = pid_alive(read_pid(MIHOMO_PID_FILE))
-    return 200, {
-        "ok": proc.returncode == 0,
+    cfg_after = _config_sig()
+    pid_after = read_pid(MIHOMO_PID_FILE)
+    running = pid_alive(pid_after)
+
+    # 三个独立的事实，前端据此判断「到底生效了没有」：
+    #   config_updated   —— config.yaml 被重写过
+    #   kernel_restarted —— 内核换了新 PID（旧进程还在跑旧配置的情况必须暴露出来）
+    config_updated = cfg_after[0] != 0 and cfg_after != cfg_before
+    kernel_restarted = bool(pid_after) and pid_after != pid_before
+    ok = proc.returncode == 0
+
+    body = {
+        "ok": ok,
         "returncode": proc.returncode,
+        "config_updated": config_updated,
+        "kernel_restarted": kernel_restarted,
+        "kernel_pid_before": pid_before,
+        "kernel_pid_after": pid_after,
         "mihomo_running": running,
         "stdout": (proc.stdout or "")[-2000:],
         "stderr": (proc.stderr or "")[-2000:],
         "log": safe_tail(os.path.join(VAR_DIR, "info.log"), 40),
     }
+    if ok:
+        return 200, body
+
+    # 非 0 就别再返回 200：前端（以及任何直接调 API 的脚本）都该明确看到这是失败。
+    # 返回码 3 是 config_callback 约定的「配置已写入但内核重启失败」。
+    if proc.returncode == 3:
+        body["error"] = "配置已写入，但内核重启失败——新配置不会生效，请查看日志"
+    else:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        body["error"] = "生成配置失败（config_callback 返回 %s）%s" % (
+            proc.returncode, ("：" + detail[-1]) if detail else "",
+        )
+    return 500, body
 
 
 def do_refresh():
@@ -1383,6 +1422,13 @@ class Handler(BaseHTTPRequestHandler):
                     data["sub_type"] = "none"
                     data["sub_url"] = ""
                     data["sub_path"] = ""
+                else:
+                    # 给了 id 但清单里找不到（例如另一个标签页刚删掉了这条）：
+                    # 沿用当前实际生效的订阅，绝不在这里静默把订阅清成 none。
+                    cur = current_sub()
+                    data["sub_type"] = cur["type"]
+                    data["sub_url"] = cur["url"]
+                    data["sub_path"] = cur["path"]
             errors = validate_settings(data)
             if errors:
                 return self._json(400, {"ok": False, "errors": errors})
