@@ -13,6 +13,22 @@ UI_TARGET="${VAR_DIR}/ui"
 LOG_FILE="${VAR_DIR}/info.log"
 CONFIG_FILE="${VAR_DIR}/config.yaml"
 
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"
+}
+
+# 防御：fnOS 的向导/管理界面一定会带 wizard_* 环境变量下发。
+# 若一个都没有（用户手动执行 `bash /var/apps/miproxy/cmd/config_callback` 排障的场景），
+# 就回退到 settings.conf 里已生效的配置；否则会把订阅、端口等整体清空成默认值。
+if [ -z "${wizard_sub_type+X}${wizard_http_port+X}${wizard_tun_enable+X}" ] && [ -f "${TRIM_PKGETC}/settings.conf" ]; then
+    log_msg "未收到 wizard_* 环境变量（疑似手动执行），改为复用 settings.conf 中的现有配置"
+    while IFS='=' read -r _wk _wv; do
+        case "${_wk}" in
+            wizard_*) export "${_wk}=${_wv}" ;;
+        esac
+    done < "${TRIM_PKGETC}/settings.conf"
+fi
+
 PROXY_USER="${wizard_proxy_user:-}"
 PROXY_PASS="${wizard_proxy_pass:-}"
 SECRET="${wizard_secret:-}"
@@ -22,21 +38,17 @@ SUB_PATH="${wizard_sub_path:-}"
 REFRESH_INTERVAL_HOURS="${wizard_refresh_interval:-0}"
 TUN_ENABLE="${wizard_tun_enable:-false}"
 
-HTTP_PORT=""; API_PORT=""; PREV_SUB_URL=""
+HTTP_PORT=""; API_PORT=""; PREV_SUB_URL=""; ADMIN_PORT_KEEP=""; ADMIN_TOKEN_KEEP=""
 if [ -f "${TRIM_PKGETC}/settings.conf" ]; then
-    HTTP_PORT=$(grep '^wizard_http_port=' "${TRIM_PKGETC}/settings.conf" | cut -d= -f2- | tr -d '
-')
-    API_PORT=$(grep '^wizard_api_port=' "${TRIM_PKGETC}/settings.conf" | cut -d= -f2- | tr -d '
-')
-    PREV_SUB_URL=$(grep '^wizard_sub_url=' "${TRIM_PKGETC}/settings.conf" | cut -d= -f2- | tr -d '
-')
+    HTTP_PORT=$(grep '^wizard_http_port=' "${TRIM_PKGETC}/settings.conf" | cut -d= -f2- | tr -d '\r\n')
+    API_PORT=$(grep '^wizard_api_port=' "${TRIM_PKGETC}/settings.conf" | cut -d= -f2- | tr -d '\r\n')
+    PREV_SUB_URL=$(grep '^wizard_sub_url=' "${TRIM_PKGETC}/settings.conf" | cut -d= -f2- | tr -d '\r\n')
+    # settings.conf 由本脚本整体重写，未列出的键会被丢弃 —— 管理服务相关键需显式保留
+    ADMIN_PORT_KEEP=$(grep '^wizard_admin_port=' "${TRIM_PKGETC}/settings.conf" | cut -d= -f2- | tr -d '[:space:]')
+    ADMIN_TOKEN_KEEP=$(grep '^wizard_admin_token=' "${TRIM_PKGETC}/settings.conf" | cut -d= -f2- | tr -d '[:space:]')
 fi
-HTTP_PORT="${HTTP_PORT:-7890}"
-API_PORT="${API_PORT:-9090}"
-
-log_msg() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"
-}
+HTTP_PORT="${wizard_http_port:-${HTTP_PORT:-7890}}"
+API_PORT="${wizard_api_port:-${API_PORT:-9090}}"
 
 log_msg "config_callback v7 启动"
 log_msg "  HTTP_PORT=${HTTP_PORT}, API_PORT=${API_PORT}"
@@ -79,19 +91,20 @@ fi
 
 # 完整版 yaml 块提取：支持订阅源特殊格式（proxies: 块中列表项为顶格 -）
 extract_yaml_block() {
-    python3 - "$1" "$2" 2>/dev/null <<'PYEOF'
+    # 解析失败不再静默丢弃：stderr 统一写入 info.log（python3 缺失/文件不可读/语法错误均可追溯）
+    python3 - "$1" "$2" 2>>"${LOG_FILE:-/dev/null}" <<'PYEOF'
 import sys
 key = sys.argv[1] + ":"
 try:
     with open(sys.argv[2], 'r', encoding='utf-8') as f:
         lines = f.readlines()
-except:
-    sys.exit(0)
+except Exception as e:
+    sys.stderr.write("[extract_yaml_block] 读取订阅缓存失败: %s (%s: %s)\n" % (sys.argv[2], type(e).__name__, e))
+    sys.exit(3)
 result = []
 found = False
 for line in lines:
-    stripped = line.rstrip('
-')
+    stripped = line.rstrip('\n')
     if not stripped.strip():
         if found: result.append(line)
         continue
@@ -117,7 +130,18 @@ SUB_PROXIES=""; SUB_HOSTS=""; SUB_PG=""; SUB_RULES=""; SUB_DNS=""
 SUB_BYPASS=""; SUB_PROXY_PROVIDERS=""; SUB_RULE_PROVIDERS=""; SUB_SUB_RULE=""
 SUB_TUNNELS=""; SUB_LISTENERS=""; SUB_SNIFF=""; SUB_NTP=""; SUB_SCRIPT=""
 
-if [ -f "${SUB_CACHE_PATH}" ]; then
+HAVE_PY3=1
+if [ -f "${SUB_CACHE_PATH}" ] && ! command -v python3 >/dev/null 2>&1; then
+    HAVE_PY3=0
+    log_msg "错误: 未找到 python3，无法解析订阅字段，生成的 config 将不包含任何节点（请在 fnOS 安装 python3 后重新保存配置）"
+fi
+
+# 只有启用订阅（remote/local）时才使用缓存；否则即使残留旧缓存也不应把节点写进 config
+if [ -f "${SUB_CACHE_PATH}" ] && [ "${SUB_TYPE}" = "none" ]; then
+    log_msg "未启用订阅（sub_type=none），忽略已有订阅缓存，生成默认规则配置"
+fi
+
+if [ -f "${SUB_CACHE_PATH}" ] && [ "${HAVE_PY3}" = "1" ] && { [ "${SUB_TYPE}" = "remote" ] || [ "${SUB_TYPE}" = "local" ]; }; then
     # 基础字段（原有）
     SUB_PROXIES=$(extract_yaml_block "proxies" "${SUB_CACHE_PATH}")
     SUB_HOSTS=$(extract_yaml_block "hosts" "${SUB_CACHE_PATH}")
@@ -177,11 +201,16 @@ log_msg "重新生成 config.yaml..."
     echo "geodata-loader: memconservative"
     echo "tun:"
     echo "  enable: ${TUN_ENABLE}"
-    echo "  stack: system"
+    echo "  stack: mixed"
     echo "  auto-route: true"
     echo "  auto-redirect: true"
     echo "  auto-detect-interface: true"
+    echo "  device: miproxy"
+    echo "  mtu: 1500"
     echo "  dns-hijack: [\"any:53\", \"tcp://any:53\"]"
+    echo "  strict-route: true"
+    echo "  gso: true"
+    echo "  gso-max-size: 65536"
 
     # ============ 来自订阅源的字段 ============
     [ -n "${SUB_PROXIES}" ] && echo "# 节点列表（来自订阅源）" && echo "${SUB_PROXIES}"
@@ -192,7 +221,9 @@ log_msg "重新生成 config.yaml..."
         echo "${SUB_PG}"
     else
         echo "proxy-groups:"
-        echo "  - name: PROXY; type: select; proxies: [DIRECT, REJECT]"
+        echo "  - name: PROXY"
+        echo "    type: select"
+        echo "    proxies: [DIRECT, REJECT]"
     fi
 
     if [ -n "${SUB_RULES}" ]; then
@@ -207,8 +238,10 @@ log_msg "重新生成 config.yaml..."
         echo "${SUB_DNS}"
     else
         echo "dns:"
-        echo "  enable: true; listen: 0.0.0.0:53"
-        echo "  enhanced-mode: fake-ip; fake-ip-range: 198.18.0.1/16"
+        echo "  enable: true"
+        echo "  listen: 0.0.0.0:53"
+        echo "  enhanced-mode: fake-ip"
+        echo "  fake-ip-range: 198.18.0.1/16"
         echo "  fake-ip-filter: [\"+.lan\", \"+.local\"${SUB_DOMAIN_FILTER:+, \"${domain}\", \"*.${domain}\"}]"
         echo "  nameserver: [223.5.5.5, 119.29.29.29, 8.8.8.8]"
     fi
@@ -229,21 +262,32 @@ chmod 666 "${CONFIG_FILE}"
 log_msg "✅ config.yaml 已重新生成"
 
 {
-    echo "wizard_http_port=${HTTP_PORT}; wizard_api_port=${API_PORT}; wizard_tun_enable=${TUN_ENABLE}"
-    echo "wizard_sub_type=${SUB_TYPE}; wizard_refresh_interval=${REFRESH_INTERVAL_HOURS}"
+    echo "wizard_http_port=${HTTP_PORT}"
+    echo "wizard_api_port=${API_PORT}"
+    echo "wizard_tun_enable=${TUN_ENABLE}"
+    echo "wizard_sub_type=${SUB_TYPE}"
+    echo "wizard_refresh_interval=${REFRESH_INTERVAL_HOURS}"
     [ -n "${PROXY_USER}" ] && echo "wizard_proxy_user=${PROXY_USER}"
     [ -n "${PROXY_PASS}" ] && echo "wizard_proxy_pass=${PROXY_PASS}"
     [ -n "${SECRET}" ] && echo "wizard_secret=${SECRET}"
     [ -n "${SUB_URL}" ] && echo "wizard_sub_url=${SUB_URL}"
     [ -n "${SUB_PATH}" ] && echo "wizard_sub_path=${SUB_PATH}"
+    [ -n "${ADMIN_PORT_KEEP}" ] && echo "wizard_admin_port=${ADMIN_PORT_KEEP}"
+    [ -n "${ADMIN_TOKEN_KEEP}" ] && echo "wizard_admin_token=${ADMIN_TOKEN_KEEP}"
 } > "${TRIM_PKGETC}/settings.conf"
 chmod 666 "${TRIM_PKGETC}/settings.conf" 2>/dev/null
 
 rm -f "${VAR_DIR}/base.yaml" "${VAR_DIR}/subscription.yaml" "${VAR_DIR}/subscription.conf"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-bash "${SCRIPT_DIR}/main" stop 2>>"${LOG_FILE}" || true
-sleep 2
-bash "${SCRIPT_DIR}/main" start 2>>"${LOG_FILE}" && log_msg "✅ miproxy 重启成功" || log_msg "⚠️  miproxy 重启失败"
+# MIPROXY_NO_RESTART=1：由 refresh_sub 定时刷新调用时只重生成 config.yaml，不碰内核。
+# 原因：main stop 会 kill 掉调用方（订阅刷新守护进程自己），且守护进程本来就会紧接着重启内核。
+if [ "${MIPROXY_NO_RESTART:-0}" = "1" ]; then
+    log_msg "MIPROXY_NO_RESTART=1，跳过内核重启（由调用方负责重启）"
+else
+    bash "${SCRIPT_DIR}/main" stop 2>>"${LOG_FILE}" || true
+    sleep 2
+    bash "${SCRIPT_DIR}/main" start 2>>"${LOG_FILE}" && log_msg "✅ miproxy 重启成功" || log_msg "⚠️  miproxy 重启失败"
+fi
 log_msg "===== config_callback v7 完成 ====="
 exit 0

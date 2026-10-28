@@ -93,7 +93,7 @@ jobs:
 
       - name: 修复脚本权限
         run: |
-          for f in cmd/main cmd/install_init cmd/install_callback cmd/uninstall_init cmd/uninstall_callback cmd/upgrade_init cmd/upgrade_callback cmd/config_init cmd/config_callback; do
+          for f in cmd/main cmd/refresh_sub cmd/admin_server.py cmd/install_init cmd/install_callback cmd/uninstall_init cmd/uninstall_callback cmd/upgrade_init cmd/upgrade_callback cmd/config_init cmd/config_callback; do
             [ -f "$f" ] && sed -i 's/\r$//' "$f" && chmod +x "$f"
           done
           echo "✅ 脚本权限已修复"
@@ -108,6 +108,9 @@ jobs:
       - name: 准备 x86_64 包
         run: |
           echo "🔧 准备 x86_64 打包目录..."
+          
+          # 开发辅助脚本不进安装包
+          rm -rf scripts
           
           # 只保留 x86_64 的 mihomo（移动到正确位置）
           rm -rf app/server/arm64
@@ -165,7 +168,7 @@ jobs:
 
       - name: 修复脚本权限
         run: |
-          for f in cmd/main cmd/install_init cmd/install_callback cmd/uninstall_init cmd/uninstall_callback cmd/upgrade_init cmd/upgrade_callback cmd/config_init cmd/config_callback; do
+          for f in cmd/main cmd/refresh_sub cmd/admin_server.py cmd/install_init cmd/install_callback cmd/uninstall_init cmd/uninstall_callback cmd/upgrade_init cmd/upgrade_callback cmd/config_init cmd/config_callback; do
             [ -f "$f" ] && sed -i 's/\r$//' "$f" && chmod +x "$f"
           done
           echo "✅ 脚本权限已修复"
@@ -180,6 +183,9 @@ jobs:
       - name: 准备 ARM64 包
         run: |
           echo "🔧 准备 ARM64 打包目录..."
+          
+          # 开发辅助脚本不进安装包
+          rm -rf scripts
           
           # 只保留 ARM64 的 mihomo（移动到正确位置）
           rm -rf app/server/x86_64

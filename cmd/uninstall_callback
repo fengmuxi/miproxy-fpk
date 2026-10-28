@@ -11,6 +11,42 @@ echo "[$(date "+%Y-%m-%d %H:%M:%S")] uninstall_callback: 开始卸载..."
 # 获取卸载选项
 DATA_ACTION="${wizard_data_action:-keep}"
 
+# 停止管理服务（无论是否保留数据都要停）
+ADMIN_PID_FILE="${TRIM_PKGVAR}/admin.pid"
+if [ -f "${ADMIN_PID_FILE}" ]; then
+    ADMIN_PID=$(head -n 1 "${ADMIN_PID_FILE}" 2>/dev/null | tr -d '[:space:]')
+    if [ -n "${ADMIN_PID}" ] && kill -0 "${ADMIN_PID}" 2>/dev/null; then
+        kill -TERM "${ADMIN_PID}" 2>/dev/null || true
+        sleep 1
+        kill -KILL "${ADMIN_PID}" 2>/dev/null || true
+    fi
+    rm -f "${ADMIN_PID_FILE}"
+fi
+
+# 删除前确认目标是本应用专属目录：fnOS 用 appname 命名目录（…/miproxy）。
+# 万一 TRIM_* 被误设成 /vol1 之类，直接 rm -rf 就会把整卷数据删掉，所以加一道白名单。
+is_app_dir() {
+    case "$1" in
+        */miproxy|*/miproxy/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+purge_dir() {
+    local dir="$1" label="$2"
+    [ -n "${dir}" ] || return 0
+    [ -d "${dir}" ] || return 0
+    if ! is_app_dir "${dir}"; then
+        echo "[$(date "+%Y-%m-%d %H:%M:%S")] 跳过${label}：${dir}（路径不含 miproxy，出于安全不删除）"
+        return 0
+    fi
+    echo "[$(date "+%Y-%m-%d %H:%M:%S")] 删除${label}: ${dir}"
+    rm -rf "${dir:?}"/* 2>/dev/null || true
+    # 用 .[!.]* / ..?* 而不是 .*：后者会匹配 . 和 ..，必然报错
+    rm -rf "${dir:?}"/.[!.]* 2>/dev/null || true
+    rm -rf "${dir:?}"/..?* 2>/dev/null || true
+}
+
 if [ "$DATA_ACTION" = "delete" ]; then
     echo "[$(date "+%Y-%m-%d %H:%M:%S")] uninstall_callback: 选择删除全部数据"
     
@@ -21,58 +57,18 @@ if [ "$DATA_ACTION" = "delete" ]; then
     # ============================================
     # 使用 TRIM_* 变量清理所有应用目录
     # ============================================
-    
-    # 1. TRIM_APPDEST - 已安装的 target 目录
-    # 对应: /var/apps/miproxy/target -> /vol*/@appcenter/miproxy
-    if [ -n "${TRIM_APPDEST}" ] && [ -d "${TRIM_APPDEST}" ]; then
-        echo "[$(date "+%Y-%m-%d %H:%M:%S")] 删除应用目录: ${TRIM_APPDEST}"
-        rm -rf "${TRIM_APPDEST:?}"/* 2>/dev/null || true
-    fi
-    
-    # 2. TRIM_PKGETC - 应用配置目录
-    # 对应: /var/apps/miproxy/etc -> /vol*/@appconf/miproxy
-    if [ -n "${TRIM_PKGETC}" ] && [ -d "${TRIM_PKGETC}" ]; then
-        echo "[$(date "+%Y-%m-%d %H:%M:%S")] 删除配置目录: ${TRIM_PKGETC}"
-        rm -rf "${TRIM_PKGETC:?}"/* 2>/dev/null || true
-        rm -rf "${TRIM_PKGETC:?}"/.* 2>/dev/null || true
-    fi
-    
-    # 3. TRIM_PKGVAR - 运行时数据目录
-    # 对应: /var/apps/miproxy/var -> /vol*/@appdata/miproxy
-    if [ -n "${TRIM_PKGVAR}" ] && [ -d "${TRIM_PKGVAR}" ]; then
-        echo "[$(date "+%Y-%m-%d %H:%M:%S")] 删除数据目录: ${TRIM_PKGVAR}"
-        rm -rf "${TRIM_PKGVAR:?}"/* 2>/dev/null || true
-        rm -rf "${TRIM_PKGVAR:?}"/.* 2>/dev/null || true
-    fi
-    
-    # 4. TRIM_PKGTMP - 临时目录
-    # 对应: /var/apps/miproxy/tmp -> /vol*/@apptemp/miproxy
-    if [ -n "${TRIM_PKGTMP}" ] && [ -d "${TRIM_PKGTMP}" ]; then
-        echo "[$(date "+%Y-%m-%d %H:%M:%S")] 删除临时目录: ${TRIM_PKGTMP}"
-        rm -rf "${TRIM_PKGTMP:?}"/* 2>/dev/null || true
-        rm -rf "${TRIM_PKGTMP:?}"/.* 2>/dev/null || true
-    fi
-    
-    # 5. TRIM_PKGHOME - 应用用户数据目录
-    # 对应: /var/apps/miproxy/home -> /vol*/@apphome/miproxy
-    if [ -n "${TRIM_PKGHOME}" ] && [ -d "${TRIM_PKGHOME}" ]; then
-        echo "[$(date "+%Y-%m-%d %H:%M:%S")] 删除用户数据目录: ${TRIM_PKGHOME}"
-        rm -rf "${TRIM_PKGHOME:?}"/* 2>/dev/null || true
-        rm -rf "${TRIM_PKGHOME:?}"/.* 2>/dev/null || true
-    fi
-    
-    # 6. TRIM_PKGMETA - 元数据目录
-    # 对应: /var/apps/miproxy/meta
-    if [ -n "${TRIM_PKGMETA}" ] && [ -d "${TRIM_PKGMETA}" ]; then
-        echo "[$(date "+%Y-%m-%d %H:%M:%S")] 删除元数据目录: ${TRIM_PKGMETA}"
-        rm -rf "${TRIM_PKGMETA:?}"/* 2>/dev/null || true
-        rm -rf "${TRIM_PKGMETA:?}"/.* 2>/dev/null || true
-    fi
+    purge_dir "${TRIM_APPDEST}" "应用目录"      # /vol*/@appcenter/miproxy
+    purge_dir "${TRIM_PKGETC}"  "配置目录"      # /vol*/@appconf/miproxy
+    purge_dir "${TRIM_PKGVAR}"  "数据目录"      # /vol*/@appdata/miproxy
+    purge_dir "${TRIM_PKGTMP}"  "临时目录"      # /vol*/@apptemp/miproxy
+    purge_dir "${TRIM_PKGHOME}" "用户数据目录"  # /vol*/@apphome/miproxy
+    purge_dir "${TRIM_PKGMETA}" "元数据目录"    # /var/apps/miproxy/meta
     
     # 7. 清理 PID 文件
     rm -f "${TRIM_PKGVAR}/app.pid" 2>/dev/null || true
     rm -f "${TRIM_PKGVAR}/refresh_sub.pid" 2>/dev/null || true
     rm -f "${TRIM_PKGVAR}/refresh_sub.lock" 2>/dev/null || true
+    rm -f "${TRIM_PKGVAR}/admin.pid" 2>/dev/null || true
     
     echo "[$(date "+%Y-%m-%d %H:%M:%S")] uninstall_callback: 所有数据已删除"
 else

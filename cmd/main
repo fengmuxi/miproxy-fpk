@@ -6,6 +6,8 @@
 LOG_FILE="${TRIM_PKGVAR}/info.log"
 PID_FILE="${TRIM_PKGVAR}/app.pid"
 REFRESH_PID_FILE="${TRIM_PKGVAR}/refresh_sub.pid"
+ADMIN_PID_FILE="${TRIM_PKGVAR}/admin.pid"
+MAIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # MiProxy 核心路径
 MIHOMO_BIN="${TRIM_PKGVAR}/target/mihomo"
@@ -93,12 +95,9 @@ start_refresh_daemon() {
     fi
     
     local sub_type sub_url refresh_interval
-    sub_type=$(grep '^wizard_sub_type=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '
-')
-    sub_url=$(grep '^wizard_sub_url=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '
-')
-    refresh_interval=$(grep '^wizard_refresh_interval=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '
-')
+    sub_type=$(grep '^wizard_sub_type=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '\r\n')
+    sub_url=$(grep '^wizard_sub_url=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '\r\n')
+    refresh_interval=$(grep '^wizard_refresh_interval=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '\r\n')
     
     # 检查是否满足运行条件
     if [ "${sub_type}" != "remote" ]; then
@@ -131,21 +130,21 @@ start_refresh_daemon() {
     # 启动守护进程
     log_msg "启动订阅刷新守护进程 (间隔: ${refresh_interval} 小时)..."
     
-    # refresh_sub 脚本位置（与核心文件同目录）
+    # 守护进程脚本：fnOS 上曾把 refresh_sub 复制到数据目录再执行。
+    # 这里每次都跟安装目录比对内容并同步 —— 如果只在“不存在时复制”，
+    # 升级 .fpk 更新了 refresh_sub 之后，数据目录里的旧副本会一直生效（升级等于没生）。
     local refresh_sub_script="${TRIM_PKGVAR}/refresh_sub"
-    
-    # 如果脚本不存在，从安装目录复制
-    if [ ! -f "${refresh_sub_script}" ]; then
-        # cmd 目录在 /var/apps/miproxy/cmd/，不是 TRIM_APPDEST/cmd/
-        local install_cmd="/var/apps/miproxy/cmd/refresh_sub"
-        if [ -f "${install_cmd}" ]; then
-            cp -f "${install_cmd}" "${refresh_sub_script}"
+    local src_script
+    src_script=$(find_script "refresh_sub") || src_script=""
+    if [ -n "${src_script}" ] && [ "${src_script}" != "${refresh_sub_script}" ]; then
+        if ! cmp -s "${src_script}" "${refresh_sub_script}" 2>/dev/null; then
+            cp -f "${src_script}" "${refresh_sub_script}"
             chmod +x "${refresh_sub_script}"
-            log_msg "已复制 refresh_sub 到 ${refresh_sub_script}"
-        else
-            log_msg "错误: 无法找到 refresh_sub 脚本 (检查 ${install_cmd})"
-            return 1
+            log_msg "已同步 refresh_sub 到数据目录（来源 ${src_script}）"
         fi
+    elif [ ! -f "${refresh_sub_script}" ]; then
+        log_msg "错误: 无法找到 refresh_sub 脚本（已尝试 /var/apps、TRIM_APPDEST、TRIM_PKGVAR）"
+        return 1
     fi
     
     # 后台运行守护进程
@@ -178,6 +177,87 @@ stop_refresh_daemon() {
     fi
 }
 
+# ============ 管理服务（Web 管理界面）============
+
+find_admin_script() {
+    for p in "${MAIN_DIR}/admin_server.py" "/var/apps/miproxy/cmd/admin_server.py" \
+             "${TRIM_APPDEST}/cmd/admin_server.py" "${TRIM_PKGVAR}/cmd/admin_server.py"; do
+        [ -f "${p}" ] && { echo "${p}"; return 0; }
+    done
+    return 1
+}
+
+start_admin() {
+    # 已在运行则跳过
+    if [ -f "${ADMIN_PID_FILE}" ]; then
+        local existing_pid
+        existing_pid=$(head -n 1 "${ADMIN_PID_FILE}" 2>/dev/null | tr -d '[:space:]')
+        if check_process "${existing_pid}"; then
+            log_msg "管理服务已在运行 (PID: ${existing_pid})"
+            return 0
+        fi
+        rm -f "${ADMIN_PID_FILE}"
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        log_msg "警告: 未找到 python3，管理界面不可用（跳过启动管理服务）"
+        return 0
+    fi
+
+    local script port
+    script=$(find_admin_script) || {
+        log_msg "警告: 未找到 admin_server.py，跳过管理服务"
+        return 0
+    }
+
+    port=$(grep '^wizard_admin_port=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')
+    port="${port:-9091}"
+
+    # 端口已在监听：说明管理服务本身还活着（常见于 MIPROXY_KEEP_ADMIN=1 的原地重启后 pid 文件失准），
+    # 不要再拉起第二个，否则两个进程抢同一端口只会互相拖累日志。
+    if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
+        log_msg "管理端口 ${port} 已在监听（视为管理服务已在运行），跳过启动；若管理页异常请检查端口占用或改 wizard_admin_port"
+        return 0
+    fi
+
+    log_msg "启动管理服务 (端口: ${port})..."
+    nohup env TRIM_PKGVAR="${TRIM_PKGVAR}" TRIM_PKGETC="${TRIM_PKGETC}" TRIM_APPDEST="${TRIM_APPDEST}" \
+        ADMIN_PORT="${port}" python3 "${script}" >> "${TRIM_PKGVAR}/admin.log" 2>&1 &
+    local pid=$!
+    echo "${pid}" > "${ADMIN_PID_FILE}"
+
+    sleep 1
+    if check_process "${pid}"; then
+        log_msg "管理服务已启动 (PID: ${pid})"
+        return 0
+    else
+        log_msg "警告: 管理服务启动失败，请查看 ${TRIM_PKGVAR}/admin.log"
+        rm -f "${ADMIN_PID_FILE}"
+        return 1
+    fi
+}
+
+stop_admin() {
+    # 由管理界面自身触发的配置变更，不能杀掉管理服务，否则请求会中断
+    if [ "${MIPROXY_KEEP_ADMIN}" = "1" ]; then
+        log_msg "配置变更中，保留管理服务"
+        return 0
+    fi
+    if [ -f "${ADMIN_PID_FILE}" ]; then
+        local pid
+        pid=$(head -n 1 "${ADMIN_PID_FILE}" 2>/dev/null | tr -d '[:space:]')
+        if [ -n "${pid}" ] && check_process "${pid}"; then
+            log_msg "停止管理服务 (PID: ${pid})..."
+            kill -TERM "${pid}" >> "${LOG_FILE}" 2>&1 || true
+            sleep 1
+            if check_process "${pid}"; then
+                kill -KILL "${pid}" 2>/dev/null || true
+            fi
+        fi
+        rm -f "${ADMIN_PID_FILE}"
+    fi
+}
+
 # ============ miproxy 主进程管理 ============
 
 start_process() {
@@ -197,8 +277,9 @@ start_process() {
     fi
 
     log_msg "启动 miproxy (cmd: ${CMD})..."
-    # 启动 mihomo 到后台，日志写入 LOG_FILE
-    bash -c "${CMD}" >> ${LOG_FILE} 2>&1 &
+    # 直接调用而不是 `bash -c "${CMD}"`：后者会按空格重新拆词（路径含空格就废了），
+    # 且多一层 shell，$! 拿到的不一定是内核自己的 PID。
+    "${MIHOMO_BIN}" -d "${MIHOMO_DIR}" -f "${MIHOMO_CONFIG}" >> "${LOG_FILE}" 2>&1 &
     local pid=$!
     printf "%s" "${pid}" > ${PID_FILE}
 
@@ -220,8 +301,9 @@ start_process() {
 stop_process() {
     log_msg "停止 miproxy..."
 
-    # 先停止订阅刷新守护进程
+    # 先停止订阅刷新守护进程与管理服务
     stop_refresh_daemon
+    stop_admin
 
     local pid=""
     if [ -r "${PID_FILE}" ]; then
@@ -256,7 +338,11 @@ stop_process() {
 
 case "$1" in
 start)
-    if start_process; then
+    start_process
+    rc=$?
+    # 无论内核是否成功都启动管理服务，便于在界面里排查/修正配置
+    start_admin
+    if [ ${rc} -eq 0 ]; then
         exit 0
     else
         # 把错误写到 fnOS 能识别的地方
@@ -271,11 +357,10 @@ stop)
 restart)
     stop_process
     sleep 2
-    if start_process; then
-        exit 0
-    else
-        exit 1
-    fi
+    start_process
+    rc=$?
+    start_admin
+    exit ${rc}
     ;;
 status)
     if is_running; then

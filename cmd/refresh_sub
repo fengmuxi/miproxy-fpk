@@ -26,6 +26,15 @@ is_mihomo_running() {
 
 # 重启 mihomo
 restart_mihomo() {
+    if [ ! -x "${MIHOMO_BIN}" ]; then
+        log_msg "重启失败: mihomo 二进制不存在或不可执行 (${MIHOMO_BIN})"
+        return 1
+    fi
+    if [ ! -f "${MIHOMO_CONFIG}" ]; then
+        log_msg "重启失败: 配置文件不存在 (${MIHOMO_CONFIG})"
+        return 1
+    fi
+
     log_msg "重启 mihomo..."
     
     # 停止
@@ -39,8 +48,8 @@ restart_mihomo() {
         rm -f "${PID_FILE}"
     fi
     
-    # 启动
-    bash -c "${MIHOMO_BIN} -d ${MIHOMO_DIR} -f ${MIHOMO_CONFIG}" >> "${MIHOMO_LOG}" 2>&1 &
+    # 启动（直接调用，不经 `bash -c`：路径含空格会被拆错，且多一层 shell 会让 PID 对不上内核）
+    "${MIHOMO_BIN}" -d "${MIHOMO_DIR}" -f "${MIHOMO_CONFIG}" >> "${MIHOMO_LOG}" 2>&1 &
     local new_pid=$!
     echo "${new_pid}" > "${PID_FILE}"
     sleep 2
@@ -71,33 +80,44 @@ check_should_run() {
 
 # 获取刷新间隔（秒）
 get_interval_seconds() {
-    local refresh_interval
-    refresh_interval=$(grep '^wizard_refresh_interval=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '\n\r')
-    echo $((refresh_interval * 3600))
+    local refresh_interval sec
+    refresh_interval=$(grep '^wizard_refresh_interval=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '\r\n')
+    case "${refresh_interval}" in
+        ''|*[!0-9]*) sec=3600 ;;                                   # 非数字：退回 1 小时，别让 $(( )) 报错后 sleep 空参
+        *) sec=$((refresh_interval * 3600)) ;;
+    esac
+    # 下限 60 秒：间隔为 0 时 sleep 0 会让 while 循环满载空转（狂写日志 + 吃满 CPU）
+    [ "${sec}" -ge 60 ] || sec=60
+    echo "${sec}"
 }
 
-# 执行订阅刷新
-do_refresh() {
-    # 加锁防止并发
-    if [ -f "${LOCK_FILE}" ]; then
-        log_msg "上次刷新尚未完成，跳过"
-        return 0
+# 判断残留锁：持锁进程已消失，或者锁存在超过 30 分钟（正常一次刷新 1~2 分钟）
+lock_is_stale() {
+    [ -f "${LOCK_FILE}" ] || return 1
+    local lpid
+    lpid=$(head -n 1 "${LOCK_FILE}" 2>/dev/null | tr -d '[:space:]')
+    if [ -n "${lpid}" ] && kill -0 "${lpid}" 2>/dev/null; then
+        if [ -n "$(find "${LOCK_FILE}" -mmin +30 2>/dev/null)" ]; then
+            return 0
+        fi
+        return 1
     fi
-    touch "${LOCK_FILE}"
-    
+    return 0
+}
+
+# 下载并校验远程订阅到缓存（不重启内核）
+fetch_subscription() {
     local sub_url sub_cache_path
     sub_url=$(grep '^wizard_sub_url=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '\n\r')
     sub_cache_path="${TRIM_PKGVAR}/proxy_providers/subscription.yaml"
-    
+    mkdir -p "${TRIM_PKGVAR}/proxy_providers"
+
     if [ -z "${sub_url}" ]; then
         log_msg "订阅 URL 为空"
-        rm -f "${LOCK_FILE}"
         return 1
     fi
-    
+
     log_msg "开始刷新订阅: ${sub_url}"
-    
-    # 下载订阅
     if curl -fsSL --connect-timeout 15 --max-time 60 "${sub_url}" -o "${sub_cache_path}.tmp" 2>>"${DEBUG_LOG}"; then
         if [ -s "${sub_cache_path}.tmp" ]; then
             # 验证 YAML 格式
@@ -106,12 +126,6 @@ do_refresh() {
                 local size
                 size=$(stat -c%s "${sub_cache_path}" 2>/dev/null || wc -c < "${sub_cache_path}")
                 log_msg "订阅下载成功: ${size} bytes"
-                
-                # 重启 mihomo
-                restart_mihomo
-                log_msg "mihomo 已重启以应用新订阅"
-                
-                rm -f "${LOCK_FILE}"
                 return 0
             else
                 log_msg "订阅文件无效（不包含 proxies 或 proxy-providers）"
@@ -124,7 +138,75 @@ do_refresh() {
         log_msg "订阅下载失败"
         rm -f "${sub_cache_path}.tmp"
     fi
-    
+    return 1
+}
+
+# 重新生成 config.yaml（订阅节点是内嵌进配置的，只换缓存不重生成 = 没刷新）
+# 参数：restart（默认，交给 config_callback 内部重启）| no-restart（调用方自己重启内核）
+apply_config() {
+    local mode="${1:-restart}"
+
+    if [ ! -f "${TRIM_PKGETC}/settings.conf" ]; then
+        log_msg "重生成配置失败: 缺少 ${TRIM_PKGETC}/settings.conf"
+        return 1
+    fi
+
+    # config_callback 依赖 wizard_* 环境变量，这里从 settings.conf 回填（否则 SUB_TYPE 会退化成 none）
+    while IFS='=' read -r _k _v; do
+        case "${_k}" in
+            wizard_*) export "${_k}=${_v}" ;;
+        esac
+    done < "${TRIM_PKGETC}/settings.conf"
+
+    local script
+    script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config_callback"
+    if [ ! -f "${script}" ]; then
+        log_msg "重生成配置失败: 找不到 config_callback (${script})"
+        return 1
+    fi
+
+    if [ "${mode}" = "no-restart" ]; then
+        MIPROXY_NO_RESTART=1 bash "${script}"
+    else
+        bash "${script}"
+    fi
+    return $?
+}
+
+# 执行订阅刷新（定时守护进程路径）
+do_refresh() {
+    # 加锁防止并发。锁里写自己的 PID，便于识别「进程已死但锁还在」的残留：
+    # 残留锁如果不清，之后每次刷新都会被跳过，自动刷新等于静默失效。
+    if [ -f "${LOCK_FILE}" ]; then
+        if lock_is_stale; then
+            log_msg "清理残留的刷新锁，继续本次刷新"
+            rm -f "${LOCK_FILE}"
+        else
+            log_msg "上次刷新尚未完成，跳过"
+            return 0
+        fi
+    fi
+    echo "$$" > "${LOCK_FILE}"
+
+    if ! fetch_subscription; then
+        rm -f "${LOCK_FILE}"
+        return 1
+    fi
+
+    # 关键：先把新订阅写进 config.yaml，再重启内核，否则重启的仍是旧配置
+    if ! apply_config no-restart; then
+        log_msg "重新生成配置失败，跳过本次重启（继续沿用上一份配置）"
+        rm -f "${LOCK_FILE}"
+        return 1
+    fi
+
+    if restart_mihomo; then
+        log_msg "已应用新订阅：config.yaml 已重生成，mihomo 已重启"
+        rm -f "${LOCK_FILE}"
+        return 0
+    fi
+
+    log_msg "config.yaml 已更新，但 mihomo 重启失败（见上方日志）"
     rm -f "${LOCK_FILE}"
     return 1
 }
@@ -154,6 +236,28 @@ main_loop() {
 
 # 信号处理
 trap 'log_msg "收到退出信号"; rm -f "${LOCK_FILE}" "${REFRESH_PID_FILE}"; exit 0' TERM INT
+
+# 单次执行模式（供管理界面「立即刷新」调用），不走守护进程循环
+# 语义是「刷新并应用」：先更新订阅缓存，再走 config_callback 重新生成 config.yaml 并重启内核
+if [ "${1:-}" = "once" ]; then
+    log_msg "refresh_sub 单次执行（刷新并应用）"
+
+    SUB_TYPE=$(grep '^wizard_sub_type=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '\n\r')
+    if [ "${SUB_TYPE}" = "remote" ]; then
+        if ! fetch_subscription; then
+            log_msg "单次刷新失败：订阅下载或校验未通过（沿用上次缓存）"
+            exit 1
+        fi
+    elif [ "${SUB_TYPE}" = "local" ]; then
+        log_msg "本地订阅模式，由 config_callback 同步订阅文件"
+    else
+        log_msg "未配置订阅（sub_type=${SUB_TYPE:-none}），仅重新生成默认配置"
+    fi
+
+    # 复用与界面下发完全一致的生成逻辑，并由 config_callback 负责重启内核
+    apply_config restart
+    exit $?
+fi
 
 # 启动
 main_loop

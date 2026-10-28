@@ -46,13 +46,27 @@ fi
 mkdir -p "${TARGET_DIR}" "${VAR_DIR}/proxy_providers" "${UI_TARGET}" "${TRIM_PKGETC}"
 
 log_msg "复制 mihomo 核心..."
-[ -f "${APP_DEST}/server/mihomo" ] && cp -f "${APP_DEST}/server/mihomo" "${TARGET_DIR}/mihomo" && chmod +x "${TARGET_DIR}/mihomo"
+# 内置内核始终另存一份 mihomo.bundled；只有当前内核缺失时才用它补齐。
+# 这样管理界面里手动切换/升级过的内核不会在「升级应用包」时被悄悄覆盖回去，
+# 需要时可在管理界面一键「恢复内置内核」（kernel.json 里记录的是用户当前选择）。
+if [ -f "${APP_DEST}/server/mihomo" ]; then
+    cp -f "${APP_DEST}/server/mihomo" "${TARGET_DIR}/mihomo.bundled"
+    chmod +x "${TARGET_DIR}/mihomo.bundled"
+    if [ -f "${TARGET_DIR}/mihomo" ]; then
+        log_msg "  已存在内核，保留当前版本（内置内核存为 mihomo.bundled，可在管理界面「内核」页恢复）"
+    else
+        cp -f "${TARGET_DIR}/mihomo.bundled" "${TARGET_DIR}/mihomo"
+        chmod +x "${TARGET_DIR}/mihomo"
+        log_msg "  ✅ 已部署内置内核"
+    fi
+fi
 
 [ -d "${APP_DEST}/ui/zashboard" ] && mkdir -p "${UI_TARGET}/zashboard" && cp -rf "${APP_DEST}/ui/zashboard/"* "${UI_TARGET}/zashboard/" 2>/dev/null
 [ -d "${APP_DEST}/ui/metacubexd" ] && mkdir -p "${UI_TARGET}/metacubexd" && cp -rf "${APP_DEST}/ui/metacubexd/"* "${UI_TARGET}/metacubexd/" 2>/dev/null
 [ -f "${APP_DEST}/ui/config" ] && cp -f "${APP_DEST}/ui/config" "${UI_TARGET}/config"
 [ -f "${APP_DEST}/ui/index.html" ] && cp -f "${APP_DEST}/ui/index.html" "${UI_TARGET}/index.html"
 [ -d "${APP_DEST}/ui/images" ] && mkdir -p "${UI_TARGET}/images" && cp -rf "${APP_DEST}/ui/images/"* "${UI_TARGET}/images/" 2>/dev/null
+[ -d "${APP_DEST}/ui/admin" ] && mkdir -p "${UI_TARGET}/admin" && cp -rf "${APP_DEST}/ui/admin/"* "${UI_TARGET}/admin/" 2>/dev/null
 chmod 666 "${UI_TARGET}/config" 2>/dev/null
 
 [ -d "${APP_DEST}/data" ] && for f in geoip.dat geosite.dat Country.mmdb; do
@@ -76,14 +90,16 @@ fi
 
 # YAML 块提取（v7 原始逻辑，保留订阅源格式）
 extract_yaml_block() {
-    python3 - "$1" "$2" 2>/dev/null <<'PYEOF'
+    # 解析失败不再静默丢弃：stderr 统一写入 info.log（python3 缺失/文件不可读/语法错误均可追溯）
+    python3 - "$1" "$2" 2>>"${LOG_FILE:-/dev/null}" <<'PYEOF'
 import sys
 key = sys.argv[1] + ":"
 try:
     with open(sys.argv[2], 'r', encoding='utf-8') as f:
         lines = f.readlines()
-except:
-    sys.exit(0)
+except Exception as e:
+    sys.stderr.write("[extract_yaml_block] 读取订阅缓存失败: %s (%s: %s)\n" % (sys.argv[2], type(e).__name__, e))
+    sys.exit(3)
 result = []
 found = False
 for line in lines:
@@ -112,7 +128,18 @@ SUB_PROXIES=""; SUB_HOSTS=""; SUB_PG=""; SUB_RULES=""; SUB_DNS=""
 SUB_BYPASS=""; SUB_PROXY_PROVIDERS=""; SUB_RULE_PROVIDERS=""; SUB_SUB_RULE=""
 SUB_TUNNELS=""; SUB_LISTENERS=""; SUB_SNIFF=""; SUB_NTP=""; SUB_SCRIPT=""
 
-if [ -f "${SUB_CACHE_PATH}" ]; then
+HAVE_PY3=1
+if [ -f "${SUB_CACHE_PATH}" ] && ! command -v python3 >/dev/null 2>&1; then
+    HAVE_PY3=0
+    log_msg "错误: 未找到 python3，无法解析订阅字段，生成的 config 将不包含任何节点（请在 fnOS 安装 python3 后重新保存配置）"
+fi
+
+# 只有启用订阅（remote/local）时才使用缓存；否则即使残留旧缓存也不应把节点写进 config
+if [ -f "${SUB_CACHE_PATH}" ] && [ "${SUB_TYPE}" = "none" ]; then
+    log_msg "未启用订阅（sub_type=none），忽略已有订阅缓存，生成默认规则配置"
+fi
+
+if [ -f "${SUB_CACHE_PATH}" ] && [ "${HAVE_PY3}" = "1" ] && { [ "${SUB_TYPE}" = "remote" ] || [ "${SUB_TYPE}" = "local" ]; }; then
     # 基础字段
     SUB_PROXIES=$(extract_yaml_block "proxies" "${SUB_CACHE_PATH}")
     SUB_HOSTS=$(extract_yaml_block "hosts" "${SUB_CACHE_PATH}")
@@ -172,7 +199,7 @@ log_msg "生成 config.yaml..."
     echo "  auto-detect-interface: true"
     echo "  device: miproxy"
     echo "  mtu: 1500"
-    echo "  dns-hijack: ["any:53", "tcp://any:53"]"
+    echo "  dns-hijack: [\"any:53\", \"tcp://any:53\"]"
     echo "  strict-route: true"
     echo "  gso: true"
     echo "  gso-max-size: 65536"
@@ -185,7 +212,9 @@ log_msg "生成 config.yaml..."
         echo "${SUB_PG}"
     else
         echo "proxy-groups:"
-        echo "  - name: PROXY; type: select; proxies: [DIRECT, REJECT]"
+        echo "  - name: PROXY"
+        echo "    type: select"
+        echo "    proxies: [DIRECT, REJECT]"
     fi
 
     if [ -n "${SUB_RULES}" ]; then
@@ -236,6 +265,16 @@ log_msg "✅ config.yaml 已生成"
 
 rm -f "${VAR_DIR}/base.yaml" "${VAR_DIR}/subscription.yaml" "${VAR_DIR}/subscription.conf"
 
+# settings.conf 下面会整体重写，未列出的键会被丢弃。
+# wizard_admin_port / wizard_admin_token 不在向导字段里（由管理界面或手动维护），必须显式保留，
+# 否则「卸载时保留数据 → 重新安装」会把管理端口/令牌改回默认值。
+ADMIN_PORT_KEEP=""
+ADMIN_TOKEN_KEEP=""
+if [ -f "${TRIM_PKGETC}/settings.conf" ]; then
+    ADMIN_PORT_KEEP=$(grep '^wizard_admin_port=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')
+    ADMIN_TOKEN_KEEP=$(grep '^wizard_admin_token=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')
+fi
+
 {
     echo "wizard_http_port=${HTTP_PORT}"
     echo "wizard_api_port=${API_PORT}"
@@ -247,6 +286,8 @@ rm -f "${VAR_DIR}/base.yaml" "${VAR_DIR}/subscription.yaml" "${VAR_DIR}/subscrip
     [ -n "${SECRET}" ] && echo "wizard_secret=${SECRET}"
     [ -n "${SUB_URL}" ] && echo "wizard_sub_url=${SUB_URL}"
     [ -n "${SUB_PATH}" ] && echo "wizard_sub_path=${SUB_PATH}"
+    [ -n "${ADMIN_PORT_KEEP}" ] && echo "wizard_admin_port=${ADMIN_PORT_KEEP}"
+    [ -n "${ADMIN_TOKEN_KEEP}" ] && echo "wizard_admin_token=${ADMIN_TOKEN_KEEP}"
 } > "${TRIM_PKGETC}/settings.conf"
 chmod 666 "${TRIM_PKGETC}/settings.conf" 2>/dev/null
 

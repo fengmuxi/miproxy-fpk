@@ -1,0 +1,1176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MiProxy 管理</title>
+<link rel="icon" href="data:,">
+<style>
+  :root{
+    --accent:#667eea; --accent2:#764ba2;
+    --bg:#f5f6fa; --card:#fff; --line:#e6e8f0;
+    --text:#1a1a2e; --muted:#7a7f95;
+    --ok:#16a34a; --warn:#f59e0b; --err:#dc2626;
+    --radius:14px;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+       background:var(--bg);color:var(--text);line-height:1.55}
+  .wrap{max-width:1012px;margin:0 auto;padding:0 20px;width:100%}
+
+  /* 顶部导航 */
+  .topbar{position:sticky;top:0;z-index:20;background:rgba(255,255,255,.94);
+          backdrop-filter:saturate(180%) blur(10px);border-bottom:1px solid var(--line)}
+  .topbar .wrap{display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding-top:10px;padding-bottom:10px}
+  .brand{display:flex;align-items:center;gap:10px;min-width:0}
+  .brand-text{min-width:0}
+  .brand h1{font-size:16px;font-weight:700;line-height:1.2}
+  .brand .sub{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px}
+  .tabs{display:flex;gap:4px;margin-left:auto;overflow-x:auto;scrollbar-width:none}
+  .tabs::-webkit-scrollbar{display:none}
+  .tab{display:block;padding:8px 14px;border-radius:9px;font-size:13.5px;font-weight:600;
+       color:#5b6072;text-decoration:none;white-space:nowrap;transition:.15s}
+  .tab:hover{background:#eef0fb;color:#3f45a0}
+  .tab.active{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff}
+  main.wrap{padding-top:18px;padding-bottom:30px}
+  .view{display:none}
+  .view.active{display:block}
+
+  /* 顶部 */
+  .logo{width:38px;height:38px;border-radius:11px;background:linear-gradient(135deg,var(--accent),var(--accent2));
+        display:flex;align-items:center;justify-content:center;flex-shrink:0}
+  .logo svg{width:22px;height:22px;fill:#fff}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#c3c7d4;margin-right:6px;vertical-align:middle}
+  .dot.on{background:var(--ok);box-shadow:0 0 0 3px rgba(22,163,74,.15)}
+  .dot.off{background:var(--err);box-shadow:0 0 0 3px rgba(220,38,38,.12)}
+
+  /* 状态条 */
+  .chips{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:18px}
+  .chip{background:var(--card);border:1px solid var(--line);border-radius:999px;padding:7px 14px;font-size:13px;
+        display:flex;align-items:center;gap:8px}
+  .chip b{font-weight:600}
+
+  /* 卡片 */
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:20px;margin-bottom:16px;
+        box-shadow:0 1px 3px rgba(20,20,50,.04)}
+  .card h2{font-size:15px;font-weight:700;margin-bottom:4px;display:flex;align-items:center;gap:8px}
+  .card .hint{font-size:12.5px;color:var(--muted);margin-bottom:16px}
+  .card .hint code{white-space:nowrap;background:#f1f2f8;border-radius:5px;padding:1px 5px;font-size:12px}
+
+  .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px 18px}
+  @media(max-width:700px){.grid{grid-template-columns:1fr}}
+  @media(max-width:640px){
+    .tabs{order:3;width:100%;margin-left:0}
+    .brand .sub{max-width:190px}
+  }
+  .field{display:flex;flex-direction:column;gap:6px}
+  .field.full{grid-column:1/-1}
+  label{font-size:13px;color:#4a4f63;font-weight:500}
+  input[type=text],input[type=password],input[type=number],select{
+    width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;font-size:14px;background:#fbfbfd;
+    color:var(--text);outline:none;transition:border-color .15s,box-shadow .15s}
+  input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(102,126,234,.14);background:#fff}
+  .row-inline{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .seg{display:flex;border:1px solid var(--line);border-radius:9px;overflow:hidden}
+  .seg label{padding:9px 16px;font-size:13.5px;cursor:pointer;background:#fbfbfd;color:#4a4f63;user-select:none}
+  .seg input{display:none}
+  .seg input:checked + span{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff}
+  .seg span{display:block;padding:9px 16px;font-size:13.5px;transition:.15s}
+
+  .muted{color:var(--muted);font-size:12.5px}
+  .tag{font-size:11.5px;padding:2px 8px;border-radius:999px;background:#eef0fb;color:#5b62b8}
+
+  /* 按钮 */
+  .btn{border:none;border-radius:9px;padding:10px 18px;font-size:14px;font-weight:600;cursor:pointer;transition:.15s}
+  .btn.primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff}
+  .btn.primary:hover{filter:brightness(1.06)}
+  .btn.ghost{background:#eef0fb;color:#4d54a8}
+  .btn.ghost:hover{background:#e3e6f8}
+  .btn:disabled{opacity:.55;cursor:not-allowed}
+  .actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:6px}
+
+  /* 日志 */
+  pre{background:#11131c;color:#c9d1e3;border-radius:10px;padding:14px;font-size:12.5px;line-height:1.5;
+      max-height:300px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+  .logbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+  .logbar select,.logbar input{width:auto}
+
+  /* 订阅列表 */
+  .sub-list{display:flex;flex-direction:column;gap:8px}
+  .sub-row{display:flex;align-items:center;gap:10px;border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:#fbfbfd}
+  .sub-row.active{border-color:#b9c0f5;background:#f4f6ff;box-shadow:0 0 0 3px rgba(102,126,234,.08)}
+  .sub-row input[type=radio]{width:16px;height:16px;accent-color:var(--accent);flex-shrink:0;cursor:pointer;margin:0}
+  .sub-main{flex:1;min-width:0}
+  .sub-name{font-size:14px;font-weight:600;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .sub-addr{font-size:12.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
+  .sub-row .btn.mini{padding:6px 12px;font-size:13px;flex-shrink:0}
+  .sub-acts{display:flex;align-items:center;gap:8px;flex-shrink:0}
+  @media(max-width:640px){
+    /* 窄屏：名称/地址独占一行，类型与操作按钮换到下一行右对齐 */
+    .sub-row{flex-wrap:wrap}
+    .sub-acts{order:3;width:100%;justify-content:flex-end;padding-left:26px}
+  }
+  .btn.mini.danger{background:#fee2e2;color:#b91c1c}
+  .btn.mini.danger:hover{background:#fecaca}
+  .sub-empty{border:1px dashed var(--line);border-radius:10px;padding:14px;color:var(--muted);font-size:13px;text-align:center}
+  .badge-on{font-size:11.5px;padding:1px 8px;border-radius:999px;background:#dcfce7;color:#166534;font-weight:600}
+  .sub-form{display:none;margin-top:14px;padding:16px;border:1px dashed #c9cff2;border-radius:12px;background:#fafbff}
+  .sub-form.show{display:block}
+
+  /* 提示 */
+  #toast{position:fixed;right:20px;bottom:20px;max-width:420px;background:#11131c;color:#fff;padding:12px 16px;
+         border-radius:10px;font-size:13px;opacity:0;transform:translateY(8px);transition:.2s;pointer-events:none;z-index:99}
+  #toast.show{opacity:1;transform:translateY(0)}
+  #toast.err{background:#7f1d1d}
+  #toast.ok{background:#14532d}
+
+  .banner{display:none;background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;border-radius:10px;
+          padding:12px 14px;font-size:13px;margin-bottom:16px}
+  .banner.show{display:block}
+  .banner input{max-width:260px;display:inline-block;margin:0 8px;padding:7px 10px;background:#fff}
+  .err-list{color:var(--err);font-size:13px;margin-top:8px}
+  .err-list li{margin-left:18px}
+
+  /* 内核 */
+  .kgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px 18px;margin-bottom:14px}
+  .kgrid .k-item{min-width:0}
+  .kgrid .k-label{display:block;font-size:12px;color:var(--muted);margin-bottom:2px}
+  .kgrid .k-val{font-size:14px;font-weight:600;word-break:break-all}
+  .kbar{height:8px;border-radius:999px;background:#eef0f7;overflow:hidden;margin:6px 0 10px}
+  .kbar-fill{display:block;height:100%;width:0;border-radius:999px;background:linear-gradient(90deg,var(--accent),var(--accent2));
+             transition:width .25s ease}
+  .kbar-fill.ok{background:linear-gradient(90deg,#34d399,#16a34a)}
+  .kbar-fill.err{background:linear-gradient(90deg,#f87171,#dc2626)}
+  .k-ver-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .k-ver-row select{flex:1;min-width:180px;max-width:320px}
+  .k-ver-row input[type=text]{flex:1 1 220px;width:auto;min-width:180px}
+  @media(max-width:640px){
+    /* 窄屏：输入框独占一行、按钮整行，避免占位提示被裁掉 */
+    .k-ver-row{flex-direction:column;align-items:stretch}
+    /* 竖排时 flex-basis 会作用于高度，必须清掉，否则输入框被拉得很高 */
+    .k-ver-row select,.k-ver-row input[type=text]{flex:0 0 auto;width:100%;max-width:none;min-width:0}
+    .k-ver-row .btn{width:100%}
+  }
+  .k-log{max-height:160px;font-size:12px}
+  .k-meta{font-size:12.5px;color:var(--muted);margin-top:8px;line-height:1.5}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="wrap">
+    <div class="brand">
+      <div class="logo"><svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg></div>
+      <div class="brand-text">
+        <h1>MiProxy 管理</h1>
+        <div class="sub"><span id="dot" class="dot"></span><span id="stateText">正在读取状态…</span></div>
+      </div>
+    </div>
+    <nav class="tabs" id="navTabs">
+      <a class="tab active" href="#/overview" data-view="overview">概览</a>
+      <a class="tab" href="#/subscriptions" data-view="subscriptions">订阅</a>
+      <a class="tab" href="#/proxy" data-view="proxy">代理与面板</a>
+      <a class="tab" href="#/kernel" data-view="kernel">内核</a>
+      <a class="tab" href="#/logs" data-view="logs">日志</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap" id="views">
+
+  <div class="banner" id="authBanner">
+    <span id="authHint">该管理接口已启用密钥校验，请输入<b>面板密钥</b>（`wizard_secret`）：</span>
+    <input type="password" id="tokenInput" placeholder="面板密钥">
+    <button class="btn primary" id="tokenBtn" type="button">连接</button>
+  </div>
+
+  <!-- ==================== 概览 ==================== -->
+  <section class="view active" id="view-overview">
+
+    <div class="chips">
+      <div class="chip">内核 <span class="dot" id="mDot"></span><b id="mText">未知</b></div>
+      <div class="chip">管理端口 <b id="adPort">—</b></div>
+      <div class="chip">config.yaml <b id="cfgText">—</b></div>
+      <div class="chip">订阅缓存 <b id="subText">—</b></div>
+      <div class="chip">当前订阅 <b id="ovSub">—</b></div>
+      <div class="chip">自动刷新 <b id="ovRefresh">—</b></div>
+      <div class="chip">内核版本 <b id="ovKernel">—</b></div>
+    </div>
+
+    <div class="card">
+      <h2>快捷操作</h2>
+      <div class="hint">常用动作集中在这里，详细配置分别在各菜单页。</div>
+      <div class="actions">
+        <button class="btn primary" id="reloadBtn" type="button">刷新状态</button>
+        <a class="btn ghost" href="#/subscriptions">订阅管理</a>
+        <a class="btn ghost" href="#/proxy">代理与面板</a>
+        <a class="btn ghost" href="#/kernel">内核升级</a>
+        <a class="btn ghost" href="#/logs">查看日志</a>
+      </div>
+      <div class="err-list" id="ovErr"></div>
+    </div>
+
+    <div class="card">
+      <h2>最近日志 <span class="tag">info.log · 20 行</span></h2>
+      <div class="hint">完整日志与自动刷新请到「日志」页。</div>
+      <pre id="ovLog">正在读取…</pre>
+    </div>
+
+  </section>
+
+  <!-- ==================== 订阅 ==================== -->
+  <section class="view" id="view-subscriptions">
+
+  <!-- 订阅 -->
+  <div class="card">
+    <h2>订阅管理 <span class="tag" id="subTypeTag">未启用</span></h2>
+    <div class="hint">可保存多个订阅，但<strong>同一时间只有「启用」的一个生效</strong>；切换启用会立即重新生成配置并重启内核。支持 Clash / mihomo 格式（含 <code>proxies:</code> 或 <code>proxy-providers:</code>）。</div>
+
+    <div class="sub-list" id="subList"></div>
+    <div class="err-list" id="subErr"></div>
+
+    <div class="sub-form" id="subForm">
+      <div class="grid">
+        <div class="field">
+          <label>名称</label>
+          <input type="text" id="f_name" placeholder="例如：机场 A / 公司订阅">
+        </div>
+        <div class="field">
+          <label>类型</label>
+          <select id="f_type">
+            <option value="remote">远程订阅 URL</option>
+            <option value="local">本地订阅文件</option>
+          </select>
+        </div>
+        <div class="field full" id="f_urlField">
+          <label>远程订阅 URL</label>
+          <input type="text" id="f_url" placeholder="https://example.com/api/v1/client/subscribe?token=xxx">
+        </div>
+        <div class="field full" id="f_pathField">
+          <label>本地订阅文件路径</label>
+          <input type="text" id="f_path" placeholder="/vol1/@appshare/miproxy/sub.yaml">
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn primary" id="subSaveBtn" type="button">保存此订阅</button>
+        <button class="btn ghost" id="subCancelBtn" type="button">取消</button>
+        <span class="muted" id="subFormHint"></span>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:16px">
+      <div class="field">
+        <label>自动刷新间隔（对启用的远程订阅生效）</label>
+        <select id="refresh_interval">
+          <option value="0">关闭自动刷新</option>
+          <option value="1">每 1 小时</option>
+          <option value="6">每 6 小时</option>
+          <option value="12">每 12 小时</option>
+          <option value="24">每 24 小时</option>
+          <option value="48">每 48 小时</option>
+        </select>
+        <span class="muted">修改后点「保存刷新间隔」生效（会重启内核与服务）</span>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button class="btn primary" id="saveSubBtn" type="button">保存刷新间隔</button>
+      <button class="btn ghost" id="addSubBtn" type="button">+ 新增订阅</button>
+      <button class="btn ghost" id="refreshBtn" type="button">立即刷新启用项</button>
+      <span class="muted" id="refreshHint">调用 refresh_sub 刷新并应用</span>
+    </div>
+  </div>
+
+  </section>
+
+  <!-- ==================== 代理与面板 ==================== -->
+  <section class="view" id="view-proxy">
+
+  <div class="card">
+    <h2>代理与面板</h2>
+    <div class="hint">修改端口后若与其它服务冲突，内核可能启动失败；请先在 NAS 上确认端口可用。</div>
+    <div class="grid">
+      <div class="field">
+        <label>代理端口（Mixed）</label>
+        <input type="number" id="http_port" min="1" max="65535" placeholder="7890">
+      </div>
+      <div class="field">
+        <label>面板 / API 端口</label>
+        <input type="number" id="api_port" min="1" max="65535" placeholder="9090">
+      </div>
+      <div class="field">
+        <label>代理用户名</label>
+        <input type="text" id="proxy_user" placeholder="留空则不启用代理认证">
+      </div>
+      <div class="field">
+        <label>代理密码</label>
+        <input type="password" id="proxy_pass" placeholder="留空保持不变">
+      </div>
+      <div class="field">
+        <label>面板密钥</label>
+        <input type="password" id="secret" placeholder="留空保持不变">
+      </div>
+      <div class="field">
+        <label>TUN 全局代理</label>
+        <div class="seg">
+          <label><input type="radio" name="tun" value="false" checked><span>关闭</span></label>
+          <label><input type="radio" name="tun" value="true"><span>启用</span></label>
+        </div>
+      </div>
+    </div>
+    <div class="row-inline" style="margin-top:14px">
+      <label class="muted"><input type="checkbox" id="clear_proxy_pass"> 清除代理密码</label>
+      <label class="muted"><input type="checkbox" id="clear_secret"> 清除面板密钥</label>
+    </div>
+    <div class="err-list" id="errList"></div>
+    <div class="actions">
+      <button class="btn primary" id="saveBtn" type="button">保存并应用</button>
+      <span class="muted" id="saveHint">将写入 settings.conf 并重启内核</span>
+    </div>
+  </div>
+
+  </section>
+
+  <!-- ==================== 内核 ==================== -->
+  <section class="view" id="view-kernel">
+
+  <div class="card">
+    <h2>当前内核 <span class="tag" id="kCurTag">—</span></h2>
+    <div class="hint">检查 mihomo 官方 Releases，一键升级或切到指定版本。切换前会自动备份当前内核，新内核起不来会自动回滚。</div>
+    <div class="kgrid">
+      <div class="k-item"><span class="k-label">当前版本</span><div class="k-val" id="kCurVer">—</div></div>
+      <div class="k-item"><span class="k-label">文件</span><div class="k-val" id="kCurMeta">—</div></div>
+      <div class="k-item"><span class="k-label">设备架构</span><div class="k-val" id="kArch">—</div></div>
+      <div class="k-item"><span class="k-label">安装包内置</span><div class="k-val" id="kBundled">—</div></div>
+    </div>
+    <div class="actions">
+      <button class="btn primary" id="kCheckBtn" type="button">检查更新</button>
+      <button class="btn ghost" id="kUpgradeBtn" type="button">升级到最新</button>
+      <button class="btn ghost" id="kRestoreBundledBtn" type="button">恢复内置内核</button>
+      <span class="muted" id="kLatestHint">尚未检查更新</span>
+    </div>
+    <div class="err-list" id="kErr"></div>
+  </div>
+
+  <div class="card" id="kTaskCard" style="display:none">
+    <h2>执行进度 <span class="tag" id="kTaskState">—</span></h2>
+    <div class="kbar"><span class="kbar-fill" id="kBar"></span></div>
+    <div class="muted" id="kTaskText">—</div>
+    <div class="actions" style="margin-top:10px">
+      <button class="btn ghost" id="kTaskShowLog" type="button">显示/隐藏明细</button>
+      <span class="muted" id="kTaskPct">0%</span>
+    </div>
+    <pre class="k-log" id="kTaskLog" style="display:none"></pre>
+  </div>
+
+  <div class="card">
+    <h2>版本切换</h2>
+    <div class="hint">列表来自「检查更新」（GitHub Releases，只显示与当前架构匹配的资产）；也可直接填版本号或本地文件路径。</div>
+    <div class="k-ver-row">
+      <select id="kVersionSel"></select>
+      <button class="btn primary" id="kSwitchBtn" type="button">切换到此版本</button>
+    </div>
+    <div class="k-ver-row" style="margin-top:10px">
+      <input type="text" id="kVersionInput" placeholder="或直接填版本号，如 v1.19.2" style="max-width:420px">
+      <button class="btn ghost" id="kInstallVerBtn" type="button">安装此版本</button>
+    </div>
+    <div class="k-ver-row" style="margin-top:10px">
+      <input type="text" id="kFilePath" placeholder="如 /vol1/@appshare/miproxy/mihomo" style="max-width:420px">
+      <button class="btn ghost" id="kInstallFileBtn" type="button">从文件安装</button>
+    </div>
+    <div class="k-meta" id="kSelMeta"></div>
+  </div>
+
+  <div class="card">
+    <h2>备份与回滚 <span class="tag" id="kBackupTag">保留最近 3 个</span></h2>
+    <div class="hint">每次切换/升级前都会把当时的内核备份到这里，出问题可一键回滚。</div>
+    <div class="sub-list" id="kBackups"></div>
+  </div>
+
+  <div class="card">
+    <h2>下载源</h2>
+    <div class="hint">访问 GitHub 慢或失败时填镜像前缀（会拼成 <code>镜像 + 原始地址</code>），例如 <code>https://ghfast.top/</code>。留空表示直连。</div>
+    <div class="k-ver-row">
+      <input type="text" id="kMirror" placeholder="https://ghfast.top/" style="max-width:420px">
+      <button class="btn ghost" id="kMirrorBtn" type="button">保存镜像</button>
+    </div>
+  </div>
+
+  </section>
+
+  <!-- ==================== 日志 ==================== -->
+  <section class="view" id="view-logs">
+
+  <div class="card">
+    <h2>日志</h2>
+    <div class="logbar">
+      <select id="log_name">
+        <option value="info">info.log（内核/启停）</option>
+        <option value="refresh">refresh_sub.log（订阅刷新）</option>
+        <option value="config">config_callback.log（配置变更）</option>
+        <option value="install">install_callback.log（安装）</option>
+        <option value="upgrade">upgrade_callback.log（升级）</option>
+        <option value="admin">admin.log（管理服务）</option>
+      </select>
+      <input type="number" id="log_lines" value="200" min="20" max="2000" style="width:96px">
+      <label class="muted"><input type="checkbox" id="log_auto"> 每 3 秒自动刷新</label>
+      <button class="btn ghost" id="logBtn" type="button">刷新日志</button>
+    </div>
+    <pre id="logView">（点击“刷新日志”加载）</pre>
+  </div>
+
+  </section>
+
+</main>
+
+<div id="toast"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  var TOKEN_KEY = "miproxy_admin_token";
+  var state = { authRequired: false, timer: null, subs: { items: [], active_id: "" }, editingId: null, subBusy: false,
+                kernel: null, kPoll: null, kBusy: false };
+
+  function $(id) { return document.getElementById(id); }
+  function token() { try { return localStorage.getItem(TOKEN_KEY) || ""; } catch (e) { return ""; } }
+  function setToken(v) { try { v ? localStorage.setItem(TOKEN_KEY, v) : localStorage.removeItem(TOKEN_KEY); } catch (e) {} }
+
+  function toast(msg, kind) {
+    var el = $("toast");
+    el.textContent = msg;
+    el.className = "show " + (kind || "");
+    clearTimeout(el._t);
+    el._t = setTimeout(function () { el.className = ""; }, 4200);
+  }
+
+  function headers(json) {
+    var h = {};
+    if (json) h["Content-Type"] = "application/json";
+    var t = token();
+    if (t) h["X-Admin-Token"] = t;
+    return h;
+  }
+
+  function showAuthBanner(noToken) {
+    var hint = $("authHint");
+    if (hint) {
+      hint.innerHTML = noToken
+        ? "未设置面板密钥：出于安全考虑，所有修改操作已被锁定。请到 fnOS 应用中心 → MiProxy → 设置 →「面板密钥」填写并保存，再回到本页输入同一密钥。"
+        : "该管理接口已启用密钥校验，请输入<b>面板密钥</b>（<code>wizard_secret</code>）：";
+    }
+    $("authBanner").classList.add("show");
+  }
+
+  function api(path, opts) {
+    opts = opts || {};
+    opts.headers = Object.assign(headers(!!opts.body), opts.headers || {});
+    return fetch(path, opts).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (body) {
+        if (res.status === 401) {
+          state.authRequired = true;
+          showAuthBanner(false);
+          throw new Error("未授权，请输入面板密钥");
+        }
+        if (!res.ok) {
+          if (body && body.need_token) showAuthBanner(true);
+          var msg = (body && body.error) || ("HTTP " + res.status);
+          if (body && body.errors) msg = body.errors.join("；");
+          var err = new Error(msg);
+          err.body = body;
+          throw err;
+        }
+        return body;
+      });
+    });
+  }
+
+  function fmtTime(ts) {
+    if (!ts) return "—";
+    var d = new Date(ts * 1000);
+    var p = function (n) { return (n < 10 ? "0" : "") + n; };
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " +
+           p(d.getHours()) + ":" + p(d.getMinutes());
+  }
+  function fmtSize(n) {
+    if (n === undefined || n === null) return "—";
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+    return (n / 1024 / 1024).toFixed(2) + " MB";
+  }
+
+  function renderStatus(s) {
+    state.authRequired = !!s.auth_required;
+    if (s.auth_required && !token()) showAuthBanner(false);
+    else if (s.write_locked) showAuthBanner(true);
+
+    var running = s.mihomo && s.mihomo.running;
+    $("dot").className = "dot " + (running ? "on" : "off");
+    $("mDot").className = "dot " + (running ? "on" : "off");
+    $("stateText").textContent = running
+      ? "内核运行中" + (s.mihomo.pid ? "（PID " + s.mihomo.pid + "）" : "")
+      : "内核未运行";
+    $("mText").textContent = running ? "运行中" : "已停止";
+    $("adPort").textContent = (s.admin && s.admin.port) || "—";
+    $("cfgText").textContent = s.config && s.config.exists
+      ? fmtSize(s.config.size) + " · " + fmtTime(s.config.mtime) : "不存在";
+    $("subText").textContent = s.subscription && s.subscription.exists
+      ? fmtSize(s.subscription.size) + " · " + fmtTime(s.subscription.mtime) : "无缓存";
+    if (s.kernel && s.kernel.version) $("ovKernel").textContent = s.kernel.version;
+  }
+
+  function applyForm(cfg) {
+    // 当前间隔可能不在预设选项里（例如向导里填了 3 小时），补一个选项以免被重置成 0
+    var sel = $("refresh_interval");
+    var cur = String(cfg.refresh_interval != null ? cfg.refresh_interval : 0);
+    var exists = false;
+    for (var i = 0; i < sel.options.length; i++) if (sel.options[i].value === cur) exists = true;
+    if (!exists) {
+      var o = document.createElement("option");
+      o.value = cur; o.textContent = cur + " 小时";
+      sel.appendChild(o);
+    }
+    sel.value = cur;
+    $("http_port").value = cfg.http_port || 7890;
+    $("api_port").value = cfg.api_port || 9090;
+    $("proxy_user").value = cfg.proxy_user || "";
+    $("proxy_pass").value = "";
+    $("secret").value = "";
+    $("proxy_pass").placeholder = cfg.proxy_pass_set ? "已设置，留空保持不变" : "留空则不启用";
+    $("secret").placeholder = cfg.secret_set ? "已设置，留空保持不变" : "留空则不启用";
+    $("clear_proxy_pass").checked = false;
+    $("clear_secret").checked = false;
+    var radios = document.getElementsByName("tun");
+    for (var i = 0; i < radios.length; i++) radios[i].checked = (radios[i].value === String(!!cfg.tun_enable));
+    $("ovRefresh").textContent = cfg.refresh_interval > 0 ? ("每 " + cfg.refresh_interval + " 小时") : "已关闭";
+  }
+
+  // ---------------------------------------------------------------- 订阅清单
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c];
+    });
+  }
+
+  function activeSub() {
+    var id = state.subs.active_id || "";
+    var items = state.subs.items || [];
+    for (var i = 0; i < items.length; i++) if (items[i].id === id) return items[i];
+    return null;
+  }
+
+  function renderSubs() {
+    var items = state.subs.items || [];
+    var active = state.subs.active_id || "";
+    var html = "";
+
+    // 单选「不使用订阅」，与各订阅互斥，保证同一时间只有一个生效
+    html += '<label class="sub-row' + (active ? "" : " active") + '">' +
+      '<input type="radio" name="sub_active" value=""' + (active ? "" : " checked") + '>' +
+      '<div class="sub-main">' +
+        '<div class="sub-name">不使用订阅</div>' +
+        '<div class="sub-addr">仅使用本地默认规则（DIRECT / REJECT）</div>' +
+      '</div></label>';
+
+    if (!items.length) {
+      html += '<div class="sub-empty">还没有保存订阅，点下方「+ 新增订阅」添加</div>';
+    }
+
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      var on = it.id === active;
+      var addr = it.type === "remote" ? (it.url || "（未填写 URL）") : (it.path || "（未填写路径）");
+      html += '<div class="sub-row' + (on ? " active" : "") + '">' +
+        '<input type="radio" name="sub_active" value="' + esc(it.id) + '"' + (on ? " checked" : "") + '>' +
+        '<div class="sub-main">' +
+          '<div class="sub-name">' + esc(it.name || "未命名") +
+            (on ? ' <span class="badge-on">已启用</span>' : '') + '</div>' +
+          '<div class="sub-addr" title="' + esc(addr) + '">' + esc(addr) + '</div>' +
+        '</div>' +
+        '<div class="sub-acts">' +
+          '<span class="tag">' + (it.type === "remote" ? "远程" : "本地") + '</span>' +
+          '<button class="btn ghost mini" type="button" data-act="edit" data-id="' + esc(it.id) + '">编辑</button>' +
+          '<button class="btn mini danger" type="button" data-act="del" data-id="' + esc(it.id) + '">删除</button>' +
+        '</div>' +
+        '</div>';
+    }
+    $("subList").innerHTML = html;
+
+    var act = activeSub();
+    $("subTypeTag").textContent = act
+      ? (act.type === "remote" ? "远程 · " : "本地 · ") + (act.name || "未命名")
+      : "未启用";
+    $("refreshHint").textContent = act
+      ? (act.type === "remote" ? "重新下载该订阅并应用" : "重新同步该本地文件并应用")
+      : "当前未启用订阅，刷新不会做任何事";
+    $("ovSub").textContent = act ? (act.name || "未命名") : "未启用";
+  }
+
+  function loadSubs() {
+    return api("/api/subscriptions").then(function (r) {
+      state.subs = { items: (r && r.items) || [], active_id: (r && r.active_id) || "" };
+      renderSubs();
+    }).catch(function (e) {
+      if (e.message.indexOf("未授权") < 0) toast("读取订阅清单失败：" + e.message, "err");
+    });
+  }
+
+  function postSubs(items, activeId, okMsg) {
+    if (state.subBusy) {
+      toast("正在应用配置，请稍候…", "err");
+      return Promise.reject(new Error("busy"));
+    }
+    state.subBusy = true;
+    $("subErr").innerHTML = "";
+    return api("/api/subscriptions", {
+      method: "POST",
+      body: JSON.stringify({ items: items, active_id: activeId })
+    }).then(function (r) {
+      if (r.applied) {
+        toast(r.mihomo_running === false
+          ? "已启用并写入配置；内核未运行，请查看日志"
+          : (okMsg || "已保存"), r.ok ? "ok" : "");
+        if (r.log) $("logView").textContent = r.log;
+      } else {
+        toast(okMsg || "已保存", "ok");
+      }
+      // 后台刷新界面，不阻塞交互（避免按钮卡在「保存中」）
+      loadSubs(); loadStatus(); loadSettings();
+      return r;
+    }).catch(function (e) {
+      toast("保存订阅失败：" + e.message, "err");
+      if (e.body && e.body.errors) {
+        $("subErr").innerHTML = e.body.errors.map(function (x) { return "<li>" + esc(x) + "</li>"; }).join("");
+      }
+      loadSubs();
+      throw e;
+    }).finally(function () {
+      state.subBusy = false;
+    });
+  }
+
+  function openForm(item) {
+    state.editingId = item ? item.id : null;
+    $("subForm").classList.add("show");
+    $("f_name").value = item ? (item.name || "") : "";
+    $("f_type").value = item ? (item.type || "remote") : "remote";
+    $("f_url").value = item ? (item.url || "") : "";
+    $("f_path").value = item ? (item.path || "") : "";
+    $("subFormHint").textContent = item ? "正在编辑「" + (item.name || "未命名") + "」" : "新增订阅";
+    syncFormType();
+    $("f_name").focus();
+  }
+
+  function closeForm() {
+    $("subForm").classList.remove("show");
+    state.editingId = null;
+    $("subErr").innerHTML = "";
+  }
+
+  function syncFormType() {
+    var t = $("f_type").value;
+    $("f_urlField").style.display = (t === "remote") ? "" : "none";
+    $("f_pathField").style.display = (t === "local") ? "" : "none";
+  }
+
+  function saveForm() {
+    var type = $("f_type").value;
+    var name = $("f_name").value.trim();
+    var item = {
+      id: state.editingId || "",
+      name: name,
+      type: type,
+      url: type === "remote" ? $("f_url").value.trim() : "",
+      path: type === "local" ? $("f_path").value.trim() : ""
+    };
+    if (!name) { toast("请填写订阅名称", "err"); return; }
+    if (type === "remote" && !/^https?:\/\//i.test(item.url)) { toast("订阅 URL 需以 http:// 或 https:// 开头", "err"); return; }
+    if (type === "local" && !item.path) { toast("请填写本地订阅文件路径", "err"); return; }
+
+    var items = (state.subs.items || []).slice();
+    var editing = !!state.editingId;
+    if (editing) {
+      for (var i = 0; i < items.length; i++) if (items[i].id === state.editingId) items[i] = item;
+    } else {
+      items.push(item);   // 不带 id，交后端生成
+    }
+    var btn = $("subSaveBtn");
+    btn.disabled = true; btn.textContent = "保存中…";
+    // 编辑的若正是启用项，后端会发现内容变化并重新应用
+    postSubs(items, state.subs.active_id, editing ? "订阅已更新" : "订阅已新增")
+      .then(closeForm)
+      .catch(function () {})
+      .then(function () { btn.disabled = false; btn.textContent = "保存此订阅"; });
+  }
+
+  function deleteSub(id) {
+    if (id === state.subs.active_id) {
+      toast("「" + (activeSub() ? activeSub().name : "该订阅") + "」正在启用，请先启用其它订阅或选「不使用订阅」", "err");
+      return;
+    }
+    var target = null;
+    for (var i = 0; i < state.subs.items.length; i++) if (state.subs.items[i].id === id) target = state.subs.items[i];
+    if (!target) return;
+    if (!window.confirm("确定删除订阅「" + target.name + "」？")) return;
+    var items = state.subs.items.filter(function (x) { return x.id !== id; });
+    postSubs(items, state.subs.active_id, "已删除订阅").catch(function () {});
+  }
+
+  function activateSub(id) {
+    id = id || "";
+    if ((state.subs.active_id || "") === id) return;
+    if (state.subBusy) { toast("正在应用配置，请稍候…", "err"); renderSubs(); return; }
+    // 乐观更新：先让单选与「已启用」标记立刻响应，失败时由 loadSubs 回滚
+    state.subs.active_id = id;
+    renderSubs();
+    postSubs(state.subs.items, id, id ? "已切换启用订阅" : "已停用订阅").catch(function () {});
+  }
+
+  function loadStatus(silent) {
+    return api("/api/status").then(renderStatus).catch(function (e) {
+      if (!silent && e.message.indexOf("未授权") < 0) toast("读取状态失败：" + e.message, "err");
+    });
+  }
+
+  function loadSettings() {
+    return api("/api/settings").then(applyForm).catch(function (e) {
+      if (e.message.indexOf("未授权") < 0) toast("读取配置失败：" + e.message, "err");
+    });
+  }
+
+  // 概览页：状态 + 当前启用订阅 + 最近日志
+  function loadOverview() {
+    return loadStatus().then(function () {
+      return api("/api/logs?name=info&lines=20").then(function (r) {
+        $("ovLog").textContent = r.content || (r.note || "（暂无日志）");
+      }).catch(function () {
+        $("ovLog").textContent = "（读取日志失败）";
+      });
+    });
+  }
+
+  function loadLogs() {
+    var name = $("log_name").value;
+    var lines = $("log_lines").value || 200;
+    return api("/api/logs?name=" + encodeURIComponent(name) + "&lines=" + encodeURIComponent(lines))
+      .then(function (r) {
+        $("logView").textContent = r.content || (r.note || "（空）");
+      }).catch(function (e) {
+        if (e.message.indexOf("未授权") < 0) $("logView").textContent = "读取日志失败：" + e.message;
+      });
+  }
+
+  function payload() {
+    var tun = "false";
+    var radios = document.getElementsByName("tun");
+    for (var i = 0; i < radios.length; i++) if (radios[i].checked) tun = radios[i].value;
+    var p = {
+      // 订阅以清单为准，只上报启用项 id，由后端校准 sub_type / sub_url / sub_path
+      active_sub_id: state.subs.active_id || "",
+      refresh_interval: parseInt($("refresh_interval").value, 10) || 0,
+      http_port: parseInt($("http_port").value, 10),
+      api_port: parseInt($("api_port").value, 10),
+      proxy_user: $("proxy_user").value.trim(),
+      proxy_pass: $("proxy_pass").value,
+      secret: $("secret").value,
+      tun_enable: tun === "true",
+      clear_proxy_pass: $("clear_proxy_pass").checked,
+      clear_secret: $("clear_secret").checked
+    };
+    return p;
+  }
+
+  function save(srcBtn) {
+    var btn = srcBtn || $("saveBtn");
+    var label = btn.textContent;
+    $("errList").innerHTML = "";
+    btn.disabled = true;
+    btn.textContent = "保存中…";
+    var p = payload();
+    api("/api/settings", { method: "POST", body: JSON.stringify(p) }).then(function (r) {
+      if (p.secret) setToken(p.secret);
+      toast(r.mihomo_running ? "配置已保存，内核已重启" : "配置已保存；内核未运行，请查看日志", r.mihomo_running ? "ok" : "");
+      if (r.log) $("logView").textContent = r.log;
+      loadStatus(); loadSettings(); loadSubs();
+    }).catch(function (e) {
+      toast("保存失败：" + e.message, "err");
+      if (e.body && e.body.errors) {
+        $("errList").innerHTML = e.body.errors.map(function (x) { return "<li>" + esc(x) + "</li>"; }).join("");
+      }
+    }).finally(function () {
+      btn.disabled = false;
+      btn.textContent = label;
+    });
+  }
+
+  function refreshNow() {
+    var btn = $("refreshBtn");
+    btn.disabled = true; btn.textContent = "刷新中…";
+    api("/api/refresh", { method: "POST" }).then(function (r) {
+      toast(r.ok ? "订阅已刷新" : "刷新完成但未成功，请查看日志", r.ok ? "ok" : "");
+      if (r.log) $("logView").textContent = r.log;
+      loadStatus();
+    }).catch(function (e) {
+      toast("刷新失败：" + e.message, "err");
+    }).finally(function () {
+      btn.disabled = false; btn.textContent = "立即刷新启用项";
+    });
+  }
+
+  function toggleAuto() {
+    stopAutoLog();
+    if ($("log_auto").checked) startAutoLog();
+  }
+
+  function startAutoLog() {
+    stopAutoLog();
+    state.timer = setInterval(loadLogs, 3000);
+  }
+
+  function stopAutoLog() {
+    if (state.timer) { clearInterval(state.timer); state.timer = null; }
+  }
+
+  // ---------------------------------------------------------------- 内核管理
+  function kernelBusy(on) {
+    state.kBusy = !!on;
+    var ids = ["kCheckBtn", "kUpgradeBtn", "kRestoreBundledBtn", "kSwitchBtn", "kInstallVerBtn", "kInstallFileBtn"];
+    for (var i = 0; i < ids.length; i++) {
+      var el = $(ids[i]);
+      if (el) el.disabled = !!on;
+    }
+  }
+
+  function fmtTaskState(s) {
+    return ({ idle: "空闲", running: "进行中", done: "已完成", error: "失败" })[s] || s || "—";
+  }
+
+  function renderKernelTask(t) {
+    var card = $("kTaskCard");
+    if (!t || t.state === "idle") { card.style.display = "none"; return; }
+    card.style.display = "";
+    var pct = Math.max(0, Math.min(100, t.percent || 0));
+    $("kBar").style.width = pct + "%";
+    $("kBar").className = "kbar-fill" + (t.state === "error" ? " err" : (t.state === "done" ? " ok" : ""));
+    $("kTaskPct").textContent = Math.round(pct) + "%";
+    $("kTaskState").textContent = fmtTaskState(t.state);
+    var parts = [];
+    if (t.phase) parts.push(t.phase);
+    // 失败时 message 与 error 往往是同一句话，只展示一次
+    var detail = t.error || t.message || "";
+    if (detail) parts.push(detail);
+    $("kTaskText").textContent = parts.join(" · ") || "—";
+    $("kTaskLog").textContent = (t.log || []).join("\n");
+    kernelBusy(t.state === "running");
+  }
+
+  function renderKernel(k) {
+    state.kernel = k;
+    var cur = k.current || {};
+    $("kCurVer").textContent = cur.version || (cur.exists ? "无法识别版本" : "内核文件不存在");
+    $("kCurTag").textContent = cur.version || "未知";
+    $("kCurMeta").textContent = cur.exists
+      ? fmtSize(cur.size) + " · " + fmtTime(cur.mtime) : "缺失（请用内置内核恢复）";
+    $("kArch").textContent = (k.arch && k.arch.machine ? k.arch.machine : "?") +
+      " → " + (k.arch && k.arch.asset ? k.arch.asset : "?");
+    var bd = k.bundled || {};
+    $("kBundled").textContent = bd.exists ? ((bd.version || "未知") + " · " + fmtSize(bd.size)) : "无内置副本";
+    $("kMirror").value = k.mirror || "";
+    $("ovKernel").textContent = cur.version || "—";
+
+    var latest = k.latest || null;
+    if (latest && latest.tag) {
+      $("kLatestHint").textContent = (k.update_available ? "发现新版本 " : "最新版本 ") + latest.tag +
+        (latest.published_at ? "（" + latest.published_at.slice(0, 10) + "）" : "");
+    } else if (k.checked_at) {
+      $("kLatestHint").textContent = "上次检查：" + fmtTime(k.checked_at) + "，未获取到版本信息";
+    } else {
+      $("kLatestHint").textContent = "尚未检查更新";
+    }
+    $("kUpgradeBtn").disabled = state.kBusy || !(latest && latest.tag && latest.tag !== cur.version);
+    if (latest && latest.tag && latest.tag !== cur.version) $("kUpgradeBtn").textContent = "升级到 " + latest.tag;
+    else $("kUpgradeBtn").textContent = "已是最新";
+
+    // 版本下拉：最新在前，其次历史版本；标注当前版本
+    var sel = $("kVersionSel");
+    var rels = k.releases || [];
+    var html = "";
+    if (!rels.length) {
+      html = '<option value="">（先点「检查更新」获取版本列表）</option>';
+    } else {
+      for (var i = 0; i < rels.length; i++) {
+        var r = rels[i];
+        var label = r.tag;
+        if (latest && r.tag === latest.tag) label += "（最新）";
+        if (cur.version && r.tag === cur.version) label += "（当前）";
+        if (r.prerelease) label += " · 预发布";
+        html += '<option value="' + esc(r.tag) + '">' + esc(label) + "</option>";
+      }
+    }
+    sel.innerHTML = html;
+    renderSelMeta();
+
+    // 备份列表
+    var backups = k.backups || [];
+    var bh = "";
+    if (!backups.length) {
+      bh = '<div class="sub-empty">还没有备份（每次切换/升级前会自动备份）</div>';
+    } else {
+      for (var j = 0; j < backups.length; j++) {
+        var b = backups[j];
+        bh += '<div class="sub-row">' +
+          '<div class="sub-main">' +
+            '<div class="sub-name">' + esc(b.version || b.name) +
+              (j === 0 ? ' <span class="tag">最近</span>' : '') + '</div>' +
+            '<div class="sub-addr">' + esc(fmtSize(b.size) + " · " + fmtTime(b.mtime)) + '</div>' +
+          '</div>' +
+          '<div class="sub-acts">' +
+            '<button class="btn ghost mini" type="button" data-act="rollback" data-name="' + esc(b.name) + '"' +
+              ' data-ver="' + esc(b.version || "") + '">回滚</button>' +
+          '</div></div>';
+      }
+    }
+    $("kBackups").innerHTML = bh;
+    $("kBackupTag").textContent = "保留最近 " + (k.max_backups || 3) + " 个";
+    renderKernelTask(k.task);
+  }
+
+  function renderSelMeta() {
+    var tag = $("kVersionSel").value;
+    var rels = (state.kernel && state.kernel.releases) || [];
+    var hit = null;
+    for (var i = 0; i < rels.length; i++) if (rels[i].tag === tag) hit = rels[i];
+    $("kSelMeta").textContent = hit
+      ? ("资产 " + (hit.asset || "（未匹配到本机架构的资产）") +
+         (hit.size ? " · " + fmtSize(hit.size) : "") +
+         (hit.published_at ? " · 发布于 " + hit.published_at.slice(0, 10) : ""))
+      : "";
+  }
+
+  function loadKernel() {
+    return api("/api/kernel").then(renderKernel).catch(function (e) {
+      if (e.message.indexOf("未授权") < 0) toast("读取内核信息失败：" + e.message, "err");
+    });
+  }
+
+  function stopKernelPoll() {
+    if (state.kPoll) { clearInterval(state.kPoll); state.kPoll = null; }
+  }
+
+  function pollKernelTask() {
+    stopKernelPoll();
+    kernelBusy(true);
+    state.kPoll = setInterval(function () {
+      api("/api/kernel/task").then(function (t) {
+        renderKernelTask(t);
+        if (t.state === "running") return;
+        stopKernelPoll();
+        kernelBusy(false);
+        loadKernel();
+        loadStatus(true);
+        if (t.state === "done") {
+          var to = (t.result && t.result.to) ? ("，当前 " + t.result.to) : "";
+          toast("内核任务完成" + to, "ok");
+        } else if (t.state === "error") {
+          toast("内核操作失败：" + (t.error || "未知错误"), "err");
+        }
+      }).catch(function () { stopKernelPoll(); kernelBusy(false); });
+    }, 1200);
+  }
+
+  function afterTaskStart(r) {
+    renderKernelTask((r && r.task) || { state: "running", percent: 1, phase: "启动中" });
+    pollKernelTask();
+  }
+
+  function kernelAction(path, body, busyHint) {
+    $("kErr").innerHTML = "";
+    kernelBusy(true);
+    return api(path, { method: "POST", body: JSON.stringify(body || {}) }).then(function (r) {
+      if (path === "/api/kernel/check") {
+        kernelBusy(false);
+        loadKernel();
+        if (r.ok) {
+          var latest = r.latest || {};
+          toast(latest.tag ? ("最新版本 " + latest.tag + (latest.tag === (state.kernel && state.kernel.current && state.kernel.current.version) ? "（已是最新）" : "")) : "检查完成", r.ok ? "ok" : "err");
+        } else {
+          toast(r.error || "检查更新失败", "err");
+          if (r.hint) $("kErr").innerHTML = "<li>" + esc(r.hint) + "</li>";
+        }
+        return r;
+      }
+      afterTaskStart(r);
+      if (busyHint) toast(busyHint, "ok");
+      return r;
+    }).catch(function (e) {
+      kernelBusy(false);
+      toast((busyHint || "操作") + "失败：" + e.message, "err");
+      throw e;
+    });
+  }
+
+  function checkKernel() {
+    var btn = $("kCheckBtn");
+    var label = btn.textContent;
+    btn.disabled = true; btn.textContent = "检查中…";
+    kernelAction("/api/kernel/check").finally(function () {
+      btn.disabled = false; btn.textContent = label;
+    });
+  }
+
+  function upgradeKernel() {
+    var k = state.kernel || {};
+    var tag = (k.latest && k.latest.tag) || "";
+    if (!tag) { toast("请先「检查更新」或直接填写版本号", "err"); return; }
+    if (!window.confirm("升级内核到 " + tag + "？\n将下载对应架构的内核并重启 miproxy（代理会短暂中断），失败会自动回滚。")) return;
+    kernelAction("/api/kernel/install", { source: "github", version: tag }, "已开始升级 " + tag);
+  }
+
+  function installVersion(tag) {
+    tag = String(tag || "").trim();
+    if (!tag) { toast("请先选择或填写版本号", "err"); return; }
+    if (!window.confirm("切换到内核 " + tag + "？\n将下载并重启 miproxy（代理会短暂中断），失败会自动回滚。")) return;
+    kernelAction("/api/kernel/install", { source: "github", version: tag }, "已开始切换到 " + tag);
+  }
+
+  function restoreBundled() {
+    if (!window.confirm("用安装包内置内核覆盖当前内核？\n当前内核会先备份，可随时回滚。")) return;
+    kernelAction("/api/kernel/install", { source: "bundled" }, "已开始恢复内置内核");
+  }
+
+  function installFromFile() {
+    var path = $("kFilePath").value.trim();
+    if (!path) { toast("请填写 NAS 上的内核文件路径", "err"); return; }
+    kernelAction("/api/kernel/install", { source: "file", path: path }, "已开始从文件安装");
+  }
+
+  function rollbackKernel(name, ver) {
+    if (!window.confirm("回滚到 " + (ver || name) + "？\n将用该备份覆盖当前内核并重启。")) return;
+    kernelAction("/api/kernel/rollback", { name: name }, "已开始回滚");
+  }
+
+  function saveMirror() {
+    var mirror = $("kMirror").value.trim();
+    api("/api/kernel/config", { method: "POST", body: JSON.stringify({ mirror: mirror }) }).then(function (r) {
+      toast(mirror ? "镜像已保存" : "已改为直连", "ok");
+      loadKernel();
+    }).catch(function (e) {
+      toast("保存镜像失败：" + e.message, "err");
+    });
+  }
+
+  // ---------------------------------------------------------------- 顶部菜单路由
+  var VIEW_LOADERS = {
+    overview: function () { loadStatus(true); loadSubs(); loadSettings(); loadOverview(); },
+    subscriptions: function () { loadSubs(); loadSettings(); },
+    proxy: function () { loadSettings(); },
+    kernel: function () { loadKernel(); },
+    logs: function () { loadLogs(); }
+  };
+
+  function currentView() {
+    var name = (location.hash || "").replace(/^#\/?/, "").replace(/\/$/, "");
+    return VIEW_LOADERS[name] ? name : "overview";
+  }
+
+  function route() {
+    var name = currentView();
+    var tabs = document.querySelectorAll("#navTabs .tab");
+    for (var i = 0; i < tabs.length; i++) {
+      tabs[i].className = "tab" + (tabs[i].getAttribute("data-view") === name ? " active" : "");
+    }
+    var views = document.querySelectorAll("#views .view");
+    for (var j = 0; j < views.length; j++) {
+      views[j].className = "view" + (views[j].id === "view-" + name ? " active" : "");
+    }
+    // 日志自动刷新只在「日志」页运行，切走即停，避免后台空转
+    if (name !== "logs") stopAutoLog();
+    else if ($("log_auto").checked) startAutoLog();
+
+    if (VIEW_LOADERS[name]) VIEW_LOADERS[name]();
+    return name;
+  }
+
+  function boot() {
+    $("reloadBtn").onclick = function () { loadStatus(); loadSubs(); loadOverview(); };
+    $("saveBtn").onclick = function () { save(this); };
+    $("saveSubBtn").onclick = function () { save(this); };
+    $("refreshBtn").onclick = refreshNow;
+    $("logBtn").onclick = loadLogs;
+    $("log_auto").onchange = toggleAuto;
+    $("log_name").onchange = loadLogs;
+    $("addSubBtn").onclick = function () { openForm(null); };
+    $("subSaveBtn").onclick = saveForm;
+    $("subCancelBtn").onclick = closeForm;
+    $("f_type").onchange = syncFormType;
+
+    // 内核
+    $("kCheckBtn").onclick = checkKernel;
+    $("kUpgradeBtn").onclick = upgradeKernel;
+    $("kRestoreBundledBtn").onclick = restoreBundled;
+    $("kSwitchBtn").onclick = function () { installVersion($("kVersionSel").value); };
+    $("kVersionSel").onchange = renderSelMeta;
+    $("kInstallVerBtn").onclick = function () { installVersion($("kVersionInput").value); };
+    $("kInstallFileBtn").onclick = installFromFile;
+    $("kMirrorBtn").onclick = saveMirror;
+    $("kTaskShowLog").onclick = function () {
+      var el = $("kTaskLog");
+      el.style.display = el.style.display === "none" ? "block" : "none";
+    };
+    $("kBackups").addEventListener("click", function (ev) {
+      var el = ev.target;
+      if (!el || !el.getAttribute) return;
+      if (el.getAttribute("data-act") === "rollback") {
+        rollbackKernel(el.getAttribute("data-name"), el.getAttribute("data-ver"));
+      }
+    });
+
+    // 单一订阅生效：切换单选后立即提交并应用
+    $("subList").addEventListener("change", function (ev) {
+      var el = ev.target;
+      if (el && el.name === "sub_active") activateSub(el.value);
+    });
+    $("subList").addEventListener("click", function (ev) {
+      var el = ev.target;
+      var act = el && el.getAttribute ? el.getAttribute("data-act") : null;
+      if (!act) return;
+      var id = el.getAttribute("data-id");
+      if (act === "edit") {
+        var found = null;
+        for (var i = 0; i < state.subs.items.length; i++) if (state.subs.items[i].id === id) found = state.subs.items[i];
+        if (found) openForm(found);
+      } else if (act === "del") {
+        deleteSub(id);
+      }
+    });
+
+    $("tokenBtn").onclick = function () {
+      setToken($("tokenInput").value.trim());
+      $("authBanner").classList.remove("show");
+      // 顶部状态点/状态文字由 renderStatus 更新，而 route() 只加载当前视图的数据；
+      // 在非「概览」页输入密钥后不主动拉一次，顶部会一直停在「正在读取状态…」。
+      loadStatus(true);
+      route();
+    };
+
+    // 顶部菜单：原生 hash 路由，刷新/收藏/前进后退都能保持页面
+    window.addEventListener("hashchange", route);
+    if (!location.hash) {
+      try { history.replaceState(null, "", "#/overview"); } catch (e) { /* file:// 下可能不支持 */ }
+    }
+
+    loadStatus(true);   // 顶部状态常驻，先拿一次
+    route();
+
+    // 状态点轻量轮询（页面不可见时跳过）
+    setInterval(function () {
+      if (!document.hidden) loadStatus(true);
+    }, 20000);
+  }
+
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
+  else boot();
+})();
+</script>
+</body>
+</html>
