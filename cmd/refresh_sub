@@ -12,6 +12,19 @@ MIHOMO_DIR="${TRIM_PKGVAR}"
 LOCK_FILE="${TRIM_PKGVAR}/refresh_sub.lock"
 REFRESH_PID_FILE="${TRIM_PKGVAR}/refresh_sub.pid"
 
+# 订阅下载统一入口（带 Clash 专用 UA，见 cmd/sub_download.sh 顶部说明）。
+# 本脚本会被复制到数据目录运行，所以辅助脚本要跟着一起复制（见 cmd/main 的
+# sync_cmd_scripts）；找不到时退回脚本内置的下载方式。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for _sd in "${SCRIPT_DIR}/sub_download.sh" "${SCRIPT_DIR}/cmd/sub_download.sh" \
+           "${TRIM_PKGVAR}/cmd/sub_download.sh" "${TRIM_PKGVAR}/sub_download.sh"; do
+    if [ -f "${_sd}" ]; then
+        . "${_sd}"
+        break
+    fi
+done
+unset _sd
+
 log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${DEBUG_LOG}"
 }
@@ -118,7 +131,24 @@ fetch_subscription() {
     fi
 
     log_msg "开始刷新订阅: ${sub_url}"
-    if curl -fsSL --connect-timeout 15 --max-time 60 "${sub_url}" -o "${sub_cache_path}.tmp" 2>>"${DEBUG_LOG}"; then
+    if command -v download_subscription >/dev/null 2>&1; then
+        # 0=拿到 Clash YAML；2=下到了但不是 Clash 格式（保留文件供诊断）；其它=失败
+        download_subscription "${sub_url}" "${sub_cache_path}"
+        local rc=$?
+        if [ "${rc}" = "0" ]; then
+            local size
+            size=$(stat -c%s "${sub_cache_path}" 2>/dev/null || wc -c < "${sub_cache_path}")
+            log_msg "订阅下载成功: ${size} bytes"
+            return 0
+        elif [ "${rc}" = "2" ]; then
+            log_msg "订阅文件无效（不包含 proxies 或 proxy-providers）"
+            return 1
+        else
+            log_msg "订阅下载失败"
+            return 1
+        fi
+    fi
+    if curl -fsSL --connect-timeout 15 --max-time 60 -A "clash.meta" "${sub_url}" -o "${sub_cache_path}.tmp" 2>>"${DEBUG_LOG}"; then
         if [ -s "${sub_cache_path}.tmp" ]; then
             # 验证 YAML 格式
             if grep -qE "^proxies:|^proxy-providers:" "${sub_cache_path}.tmp" 2>/dev/null; then

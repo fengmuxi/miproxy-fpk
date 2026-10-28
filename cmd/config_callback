@@ -13,9 +13,16 @@ UI_TARGET="${VAR_DIR}/ui"
 LOG_FILE="${VAR_DIR}/info.log"
 CONFIG_FILE="${VAR_DIR}/config.yaml"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"
 }
+
+# 订阅下载统一入口（带 Clash 专用 UA，见 cmd/sub_download.sh 顶部说明）
+if [ -f "${SCRIPT_DIR}/sub_download.sh" ]; then
+    . "${SCRIPT_DIR}/sub_download.sh"
+fi
 
 # 防御：fnOS 的向导/管理界面一定会带 wizard_* 环境变量下发。
 # 若一个都没有（用户手动执行 `bash /var/apps/miproxy/cmd/config_callback` 排障的场景），
@@ -78,12 +85,28 @@ fi
 
 if [ "${NEED_DOWNLOAD}" = "1" ]; then
     log_msg "下载远程订阅: ${SUB_URL}"
-    if curl -fsSL --connect-timeout 15 --max-time 60 "${SUB_URL}" -o "${SUB_CACHE_PATH}.tmp" 2>>"${DEBUG_LOG}" && [ -s "${SUB_CACHE_PATH}.tmp" ]; then
-        mv "${SUB_CACHE_PATH}.tmp" "${SUB_CACHE_PATH}"
-        log_msg "  ✅ 订阅下载成功: $(stat -c%s "${SUB_CACHE_PATH}" 2>/dev/null || wc -c < "${SUB_CACHE_PATH}") bytes"
+    if [ -z "${SUB_URL}" ]; then
+        log_msg "  ⚠️ 订阅类型为 remote 但没有订阅链接，跳过下载"
+    elif command -v download_subscription >/dev/null 2>&1; then
+        # download_subscription：0=拿到 Clash YAML，2=下到了但不是 Clash 格式
+        download_subscription "${SUB_URL}" "${SUB_CACHE_PATH}"
+        rc=$?
+        if [ "${rc}" = "0" ]; then
+            log_msg "  ✅ 订阅下载成功: $(stat -c%s "${SUB_CACHE_PATH}" 2>/dev/null || wc -c < "${SUB_CACHE_PATH}") bytes"
+        elif [ "${rc}" = "2" ]; then
+            log_msg "  ⚠️ 订阅已下载，但不是 Clash/mihomo 格式（已保留原缓存文件供诊断）"
+        else
+            log_msg "  ⚠️ 订阅下载失败，使用上次缓存"
+        fi
     else
-        log_msg "  ⚠️ 订阅下载失败，使用上次缓存"
-        rm -f "${SUB_CACHE_PATH}.tmp"
+        # 兜底：辅助脚本缺失时退回最原始的下载方式
+        if curl -fsSL --connect-timeout 15 --max-time 60 -A "clash.meta" "${SUB_URL}" -o "${SUB_CACHE_PATH}.tmp" 2>>"${DEBUG_LOG}" && [ -s "${SUB_CACHE_PATH}.tmp" ]; then
+            mv "${SUB_CACHE_PATH}.tmp" "${SUB_CACHE_PATH}"
+            log_msg "  ✅ 订阅下载成功: $(stat -c%s "${SUB_CACHE_PATH}" 2>/dev/null || wc -c < "${SUB_CACHE_PATH}") bytes"
+        else
+            log_msg "  ⚠️ 订阅下载失败，使用上次缓存"
+            rm -f "${SUB_CACHE_PATH}.tmp"
+        fi
     fi
 fi
 
@@ -177,6 +200,83 @@ if [ -f "${SUB_CACHE_PATH}" ] && [ "${HAVE_PY3}" = "1" ] && { [ "${SUB_TYPE}" = 
     log_msg "      script:$(printf '%s' "${SUB_SCRIPT}" | wc -l)行"
     
     [ -n "${SUB_DNS}" ] && ! printf '%s' "${SUB_DNS}" | grep -q "nameserver" && SUB_DNS="" && log_msg "  ⚠️ dns 缺 nameserver，回退本地默认"
+fi
+
+# ============ 订阅有效性校验 ============
+# 「订阅启用了，却一个节点都没解析出来」是最容易被当成成功的情况：
+# 订阅下载成功（HTTP 200）、config.yaml 也重新生成了，但里面一条 proxies 都没有，
+# 用户看到的只是「已生效」，实际节点数为 0。
+# 这里做两件事：①说清楚到底是哪种格式问题；②绝不用一份空配置覆盖掉还能用的旧配置。
+diagnose_subscription() {
+    python3 - "${1}" 2>>"${LOG_FILE}" <<'PYEOF'
+import sys, re
+p = sys.argv[1]
+try:
+    data = open(p, 'rb').read()
+except Exception as e:
+    print("订阅缓存读取失败（%s）" % e)
+    sys.exit(0)
+if not data:
+    print("订阅缓存是空文件")
+    sys.exit(0)
+text = data.decode('utf-8', 'replace')
+head = ' '.join(text[:120].split())
+size = len(data)
+stripped = text.strip()
+if re.match(r'^\s*(<\?xml|<!DOCTYPE|<html)', text, re.I):
+    print("订阅返回的是 HTML 网页而不是配置（链接可能需要 User-Agent/令牌，或被中间层劫持）；开头：%s" % head)
+elif stripped.startswith('{') or stripped.startswith('['):
+    print("订阅返回的是 JSON 而不是 Clash YAML；开头：%s" % head)
+elif ':' not in stripped and re.match(r'^[A-Za-z0-9+/=\s]{40,}$', stripped):
+    print("订阅返回的是 base64 编码内容（多半是 v2ray/ss 链接），需先转换成 Clash/mihomo 格式；开头：%s" % head[:60])
+elif 'proxies:' not in text and 'proxy-providers:' not in text:
+    print("订阅里没有 proxies: / proxy-providers: 段（共 %d 字节，开头：%s）" % (size, head))
+else:
+    print("订阅格式可疑（共 %d 字节，开头：%s）" % (size, head))
+PYEOF
+}
+
+# 当前 config.yaml 里还有没有节点（用于决定能否覆盖）
+config_has_nodes() {
+    python3 - "${CONFIG_FILE}" 2>>"${LOG_FILE}" <<'PYEOF'
+import sys
+try:
+    lines = open(sys.argv[1], encoding='utf-8', errors='replace').read().split('\n')
+except Exception:
+    print("no")
+    sys.exit(0)
+inblk = False
+for l in lines:
+    if l.startswith('proxies:'):
+        inblk = True
+        continue
+    if inblk:
+        if not l.strip():
+            continue
+        if not l[0].isspace():
+            break
+        if l.strip().startswith('-'):
+            print("yes")
+            sys.exit(0)
+print("no")
+PYEOF
+}
+
+SUB_HAS_NODES=1
+if [ "${SUB_TYPE}" = "remote" ] || [ "${SUB_TYPE}" = "local" ]; then
+    SUB_PROXY_LINES=$(printf '%s' "${SUB_PROXIES}" | wc -l | tr -d ' ')
+    SUB_PROVIDER_LINES=$(printf '%s' "${SUB_PROXY_PROVIDERS}" | wc -l | tr -d ' ')
+    if [ "${SUB_PROXY_LINES}" -eq 0 ] && [ "${SUB_PROVIDER_LINES}" -eq 0 ]; then
+        SUB_DIAG=$(diagnose_subscription "${SUB_CACHE_PATH}")
+        log_msg "  ❌ 订阅未解析出任何节点：${SUB_DIAG}"
+        if [ "$(config_has_nodes)" = "yes" ]; then
+            # 旧配置里还有能用的节点 → 保留它，别把用户洗成 0 节点
+            log_msg "  ⚠️ 已保留原 config.yaml（其中仍有可用节点），本次订阅未应用"
+            log_msg "===== config_callback v7 完成（订阅无节点，未应用）====="
+            exit 4
+        fi
+        SUB_HAS_NODES=0
+    fi
 fi
 
 log_msg "重新生成 config.yaml..."
@@ -279,12 +379,16 @@ chmod 666 "${TRIM_PKGETC}/settings.conf" 2>/dev/null
 
 rm -f "${VAR_DIR}/base.yaml" "${VAR_DIR}/subscription.yaml" "${VAR_DIR}/subscription.conf"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # MIPROXY_NO_RESTART=1：由 refresh_sub 定时刷新调用时只重生成 config.yaml，不碰内核。
 # 原因：main stop 会 kill 掉调用方（订阅刷新守护进程自己），且守护进程本来就会紧接着重启内核。
 if [ "${MIPROXY_NO_RESTART:-0}" = "1" ]; then
     log_msg "MIPROXY_NO_RESTART=1，跳过内核重启（由调用方负责重启）"
 else
+    # ⚠️ 必须保留管理服务：main stop 默认会把管理服务一起停掉，那样
+    # ① 正在打开的管理页面请求被中断，用户看到「应用崩了」；
+    # ② 被 fnOS 向导触发时（那条路径不会带 MIPROXY_KEEP_ADMIN）更是必停。
+    # 内核重启与管理服务本就是两个独立进程，改配置不该牵连管理服务。
+    export MIPROXY_KEEP_ADMIN=1
     bash "${SCRIPT_DIR}/main" stop 2>>"${LOG_FILE}" || true
     sleep 2
     if bash "${SCRIPT_DIR}/main" start 2>>"${LOG_FILE}"; then
@@ -296,6 +400,13 @@ else
         log_msg "===== config_callback v7 完成（重启失败）====="
         exit 3
     fi
+fi
+if [ "${SUB_HAS_NODES}" = "0" ]; then
+    # 配置确实写进去了（旧配置本来也没有节点），但订阅没解析出任何节点——
+    # 必须让调用方知道「没生效」，否则用户看到的仍是「已启用」。
+    log_msg "⚠️  订阅未解析出任何节点：配置已写入，但不会有可用节点"
+    log_msg "===== config_callback v7 完成（订阅无节点）====="
+    exit 4
 fi
 log_msg "===== config_callback v7 完成 ====="
 exit 0

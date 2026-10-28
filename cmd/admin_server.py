@@ -268,6 +268,32 @@ def safe_tail(path, lines):
         return "[读取日志失败] %s" % exc
 
 
+def _last_interesting_log_line(keywords, path=None):
+    """从 info.log 尾部找日志行，按 keywords 的优先级依次尝试。
+
+    用来把脚本自己的诊断原话带回接口错误信息（例如「订阅返回的是 base64
+    编码内容…」），而不是在服务端再猜一遍格式。keywords 有优先级：第一个
+    关键词命中不了才看下一个——诊断行（为什么坏）比处置行（做了什么）更重要。
+    """
+    target = path or os.path.join(VAR_DIR, "info.log")
+    try:
+        if not os.path.isfile(target):
+            return ""
+        with open(target, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return ""
+    tail = lines[-200:]
+    for kw in keywords:
+        for line in reversed(tail):
+            if kw in line:
+                # 去掉时间戳前缀与装饰符号，只留正文
+                parts = line.split(" - ", 1)
+                text = parts[1].strip() if len(parts) > 1 else line.strip()
+                return text.lstrip("❌⚠️✅ ").strip()
+    return ""
+
+
 # ---------------------------------------------------------------- 配置读写
 
 def public_settings():
@@ -543,9 +569,17 @@ def _apply_settings_locked(data, script):
         return 200, body
 
     # 非 0 就别再返回 200：前端（以及任何直接调 API 的脚本）都该明确看到这是失败。
-    # 返回码 3 是 config_callback 约定的「配置已写入但内核重启失败」。
+    # 返回码 3 是 config_callback 约定的「配置已写入但内核重启失败」，
+    # 返回码 4 是「订阅没解析出任何节点」（节点没生效，且可能保留了旧配置）。
     if proc.returncode == 3:
         body["error"] = "配置已写入，但内核重启失败——新配置不会生效，请查看日志"
+    elif proc.returncode == 4:
+        # 把 config_callback 的诊断原话带上来：它已经写清了是 base64 / HTML / 缺字段
+        diag = _last_interesting_log_line(("订阅未解析出任何节点：", "已保留原 config.yaml"))
+        if diag.startswith("订阅未解析出任何节点："):
+            diag = diag[len("订阅未解析出任何节点："):].strip()
+        body["error"] = "订阅未解析出任何节点，节点不会生效%s" % (("：" + diag) if diag else "，请检查订阅链接返回的是否为 Clash/mihomo 格式")
+        body["sub_nodes"] = 0
     else:
         detail = (proc.stderr or proc.stdout or "").strip().splitlines()
         body["error"] = "生成配置失败（config_callback 返回 %s）%s" % (
