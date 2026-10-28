@@ -27,11 +27,12 @@ miproxy-fpk/
 │   ├── server/<arch>/mihomo # 内核二进制：arm64/ 与 x86_64/ 两个目录
 │   ├── data/                # GeoIP.dat / GeoSite.dat / Country.mmdb（分流数据库）
 │   └── ui/                  # 前端：zashboard/、metacubexd/、admin/（自带管理页）、index.html（选择页）、config、images/
-│                            #   panel-back.html = 注入到两个第三方面板的「返回选择页」悬浮按钮片段（见 §9.31）
+│                            #   frame-zashboard.html / frame-metacubexd.html = 带顶栏的包装页，用 iframe 承载两个第三方面板（见 §9.31）
 ├── cmd/                     # ★ 主要“源码”：fnOS 生命周期 bash 脚本
 │   ├── main                 # 启停管理：start|stop|restart|status（含刷新守护进程 + 管理服务）
 │   ├── refresh_sub          # 订阅刷新守护进程（循环下载订阅 + 重启 mihomo）；`once` 为单次“刷新并应用”
 │   ├── admin_server.py      # 管理界面后端（Python3 标准库，端口 9091，见 §7）
+│   ├── sub_download.sh      # 订阅下载统一入口（带 clash.meta UA + 换 UA 重试，见 §9.33）
 │   ├── install_callback     # 安装后回调：拷二进制/前端/数据、下订阅、生成 config.yaml、写 settings.conf、启动
 │   ├── install_init         # 安装前回调（当前仅 exit 0）
 │   ├── config_init          # 配置变更前回调（当前仅 exit 0）
@@ -142,7 +143,7 @@ miproxy-fpk/
 | GET | `/` `/admin/` `/admin/*` | 静态页（`_serve_static`，含路径穿越防护） |
 | GET | `/api/status` | 内核/管理服务 PID 与存活、`config.yaml` 与订阅缓存大小时间、`auth_required` |
 | GET | `/api/settings` | 当前配置；**密码/密钥只返回 `proxy_pass_set` / `secret_set` 布尔值** |
-| POST | `/api/settings` | 校验 → 以 `wizard_*` 环境变量调 `config_callback` → 返回 rc、内核状态、`info.log` 尾部。请求带 `active_sub_id` 时会按清单校准 `sub_*`，防止前端旧状态覆盖订阅 |
+| POST | `/api/settings` | 校验 → 以 `wizard_*` 环境变量调 `config_callback` → 返回 rc、内核状态、`info.log` 尾部。请求带 `active_sub_id` 时会按清单校准 `sub_*`，防止前端旧状态覆盖订阅。**rc=3** 内核重启失败、**rc=4** 订阅没解析出节点（带诊断原文） |
 | GET | `/api/subscriptions` | 订阅清单 + `active_id`（以 settings.conf 反查；向导里配的订阅不在清单时会合成 `legacy` 条目） |
 | POST | `/api/subscriptions` | 保存清单；**仅当启用项变化**才调 `config_callback` 重生成配置并重启（`applied` 字段告诉前端） |
 | GET | `/api/nodes` | 解析 `config.yaml` 的 `proxies` 得节点清单（名称/类型/server/port/udp/延迟），并合并内核 `/proxies` 的 `history[-1].delay`；`kernel_running` 告知能否实测 |
@@ -184,7 +185,7 @@ miproxy-fpk/
 ## 9. 已知坑与待办（改动前请留意）
 
 1. **大小写冲突（已存在）**：`app/ui/images/` 同时有 `ICON_256.PNG` 与 `icon_256.png`，在 Windows（大小写不敏感）检出会互相覆盖，导致 `git status` 显示 `ICON_256.PNG` 为已修改。**不要在 Windows 上提交这个“修改”**，更不要在大小写文件系统上误删其一；根治需在源头把文件名统一。
-2. **版本字符串漂移**：`wizard/config` 的“关于”步骤已同步到 `v2.8.3`，但 `cmd/install_callback` 头部注释仍写 “sync v2.6.38”（脚本内部的 v9/v11 是自身迭代标记，不是产品版本，别混改）。改动时以 `manifest` 的 `version` 为准，并顺手同步这些文案。
+2. **版本字符串漂移**：`wizard/config` 的“关于”步骤已同步到 `v2.8.4`，但 `cmd/install_callback` 头部注释仍写 “sync v2.6.38”（脚本内部的 v9/v11 是自身迭代标记，不是产品版本，别混改）。改动时以 `manifest` 的 `version` 为准，并顺手同步这些文案。
 3. **README 引用了 `LICENSE`**，但仓库根目录实际**没有 LICENSE 文件**——若需合规发布应补上。
 4. **强依赖 `python3`**：`extract_yaml_block` 用 python3 解析订阅 YAML。fnOS 环境须自带 python3，否则安装会静默失败（heredoc 带 `2>/dev/null`）。
 5. **root 权限**：`config/privilege` 声明 `run-as: root`，TUN 必需；改权限相关要确认目标环境。
@@ -213,7 +214,11 @@ miproxy-fpk/
 28. **访问内核控制端口用 `config.yaml` 的 `secret`，不是 `wizard_secret`**：`wizard_secret` 是「期望值」，`config.yaml` 的 `secret` 是「内核实际生效值」。用户改了面板密钥但没重新应用配置时两者不一致，按设置项去请求必然 401 → 节点页整页 `unauthorized`，看起来像内核坏了。`_mihomo_secret()` 因此优先读 `config.yaml`，读不到才退回设置项。另外调内核 API 时必须 `ProxyHandler({})` 显式禁掉环境变量里的 `http_proxy`：目标是 `127.0.0.1`，走代理只会绕一圈失败；测速超时内核返回 **408** 且 body 里有 `{"message":...}`，这是有效信息，别当异常吞掉。
 29. **并发测速要设上限**：`test_nodes()` 用 `ThreadPoolExecutor(max_workers=6)`，单个 4 秒超时，单批最多 300 个。要是不限并发，一个 500 节点的订阅点「全部测速」会瞬间打满文件描述符和内核连接数，连正常上网都受影响。单点失败只影响该节点（`results[name].error`），不能让一个超时把整批拖垮。
 30. **`__file__` 不可信：脚本可能正从「装完就会被删的临时目录」里运行**。fnOS 安装/升级的链路是 `/vol1/appcenter-downloads/<包名>`（解包临时目录）→ 执行 `install_callback` → 拉起 `main` → 拉起 `admin_server.py`。装完临时目录被系统清理，进程却还活着（代码已在内存、静态页从数据目录读），于是 `admin_server.py` 里 `os.path.dirname(__file__)` 指向了一个已消失的路径，**所有 `os.path.isfile(CMD_DIR/xxx)` 全部失败**。现象极具迷惑性：页面、状态、订阅清单都正常，一点保存就报「找不到 config_callback 脚本」，而更早的版本还会把它当成「保存成功但没生效」。现在有两道防线：①`main` 的 `sync_cmd_scripts()` 每次启动把 `main` / `admin_server.py` / `config_callback` / `refresh_sub` 按内容比对同步到 `${TRIM_PKGVAR}/cmd/`，`find_admin_script()` 优先从那里启动；②`admin_server.find_cmd_script()` 按「数据目录 → 安装目录 → `/var/apps` → `/var/packages` → `__file__`」依次探测，报错时把查过的目录全部列出。**新增任何「按脚本自身位置找兄弟脚本」的代码，都不要只写 `os.path.join(os.path.dirname(__file__), ...)`。** 判据是「这个路径现在还能用吗」；「它是不是我的邻居」并不构成理由。
-31. **往第三方面板里加东西，只能改「数据目录里的副本」**：Zashboard / MetaCubeXD 是上游前端产物，直接改 `app/ui/<panel>/index.html` 会在下次同步二进制/升级面板时被整体覆盖，也会把仓库搞脏。返回按钮的做法是：片段单独放 `app/ui/panel-back.html`（**必须自包含**——样式内联、不引任何脚本/字体，否则面板离线或断网时会连累它自己），`install_callback` 里 `inject_panel_back()` 用 python3 插到 `</body>` 前，**靠 `miproxy-panel-back` 标记幂等**。注意 `cp -rf` 每次安装都会把面板文件恢复成原始版本，所以「已注入则跳过」这条分支实际很少走到——但必须留着，否则自定义/只读文件时会出现两个按钮。
+31. **不要改第三方面板的文件，要用「包装页 + iframe」承载**。Zashboard / MetaCubeXD 是上游前端产物：改 `app/ui/<panel>/index.html` 会在面板升级时被整体覆盖，把仓库搞脏；往里注入元素也会**挡住面板自己的操作元素**（面板里大量用 `position: fixed` 的顶栏/侧栏元素，注入的悬浮按钮正好压在侧栏图标上；用户已经明确要求改成顶部导航行）。现在的做法：`app/ui/frame-zashboard.html`、`app/ui/frame-metacubexd.html` 两个自包含的包装页，顶栏用 flex 固定 32px、`iframe` 撑满剩余高度（`flex:1 1 auto`），面板在 iframe 里按自己的视口渲染 —— 顶栏与面板零重叠，且完全不碰第三方文件。安装时把这两个文件拷到 `$TRIM_PKGVAR/ui/`（`install_callback` 里的 `_frame` 循环），选择页的入口指向它们。
+32. **`config_callback` 必须自己 `export MIPROXY_KEEP_ADMIN=1`**。管理服务调 `config_callback` 时会在环境里带这个标记，但 **fnOS 向导触发的 `config_callback` 不会带** —— 而 `config_callback` 内部要 `main stop` 重启内核，`main stop` 默认会把管理服务一起停掉，于是用户正开着的页面当场断线（表现为「应用崩了、要手动启动」）。内核重启与管理服务本就是两个独立进程，改配置不该牵连管理服务，所以这个标记要由 `config_callback` 自己无条件设置，不能指望调用方。
+33. **下载订阅必须带 `User-Agent: clash.meta`**。绝大多数订阅服务按 UA 决定返回格式：用 curl 默认 UA（`curl/8.x`）去拿，拿回来是 **base64 编码的 v2ray 链接**而不是 YAML —— 现象是「订阅下载成功、proxies 0 行、节点一个都没有」，极易被误判成解析 bug。三处下载（`install_callback` / `config_callback` / `refresh_sub`）统一走 `cmd/sub_download.sh` 的 `download_subscription()`：带 `clash.meta` 取一次，不像 Clash YAML 就换 `ClashforWindows/0.20.39` 再取一次，仍不像就把原文件留下供诊断（返回码 2）。**新增下载入口时不要再直接写 `curl`**，否则这个坑会再踩一遍。
+34. **订阅解析出 0 个节点必须判失败**。`proxies:` 与 `proxy-providers:` 都为 0 时，config.yaml 里一条节点都没有，用户却看到「已启用」。现在 `config_callback` 会：①用 `diagnose_subscription()` 判定是 base64 / HTML / JSON / 缺段；②**旧配置里还有节点就保留旧配置并 `exit 4`**（绝不用空配置洗掉还能用的节点）；③旧配置也没节点才继续写，并仍以 `exit 4` 收尾。管理服务按返回码分流：**3 = 内核重启失败、4 = 订阅无节点**，其余按未知错误处理。
+35. **`exit 4` 的诊断要从日志里捞，别在服务端另写一套判断**：`admin_server._last_interesting_log_line()` 按关键词优先级从 `info.log` 尾部取最后一条命中行（优先取「为什么坏」的诊断行，再取「做了什么」的处置行），把脚本的原话带回接口错误信息。两处判断各写一遍必然对不上。
 
 ---
 
