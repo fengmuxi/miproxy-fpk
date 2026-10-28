@@ -4,7 +4,7 @@
 
 DEBUG_LOG="${TRIM_PKGVAR}/install_callback.log"
 exec 2>>"${DEBUG_LOG}"
-echo "===== install_callback v9 开始: $(date '+%Y-%m-%d %H:%M:%S') =====" >> "${DEBUG_LOG}"
+echo "===== install_callback v10 开始: $(date '+%Y-%m-%d %H:%M:%S') =====" >> "${DEBUG_LOG}"
 
 APP_DEST="${TRIM_APPDEST}"
 VAR_DIR="${TRIM_PKGVAR}"
@@ -28,7 +28,7 @@ log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"
 }
 
-log_msg "install_callback v9 启动"
+log_msg "install_callback v10 启动"
 log_msg "  HTTP_PORT=${HTTP_PORT}, API_PORT=${API_PORT}"
 log_msg "  SUB_TYPE=${SUB_TYPE}, SUB_URL=${SUB_URL:-（空）}, SUB_PATH=${SUB_PATH:-（空）}"
 
@@ -68,6 +68,48 @@ fi
 [ -d "${APP_DEST}/ui/images" ] && mkdir -p "${UI_TARGET}/images" && cp -rf "${APP_DEST}/ui/images/"* "${UI_TARGET}/images/" 2>/dev/null
 [ -d "${APP_DEST}/ui/admin" ] && mkdir -p "${UI_TARGET}/admin" && cp -rf "${APP_DEST}/ui/admin/"* "${UI_TARGET}/admin/" 2>/dev/null
 chmod 666 "${UI_TARGET}/config" 2>/dev/null
+
+# 给两个第三方面板注入「返回面板选择」的悬浮按钮。
+# 为什么不在仓库里直接改它们的 index.html：那是第三方产物，升级面板时会被整体
+# 覆盖；改成安装时对「数据目录里的副本」做一次插入，既不污染源码，又能在每次
+# 安装/升级后自动补齐。片段单独放在 app/ui/panel-back.html，注入带标记幂等。
+inject_panel_back() {
+    local frag="${APP_DEST}/ui/panel-back.html"
+    if [ ! -f "${frag}" ]; then
+        log_msg "  未找到 panel-back.html，跳过面板返回按钮注入"
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        log_msg "  未找到 python3，跳过面板返回按钮注入（面板里将没有返回入口）"
+        return 0
+    fi
+    local target name state
+    for target in "${UI_TARGET}/zashboard/index.html" "${UI_TARGET}/metacubexd/index.html"; do
+        [ -f "${target}" ] || continue
+        name=$(basename "$(dirname "${target}")")
+        state=$(python3 - "${target}" "${frag}" <<'PYEOF' 2>>"${DEBUG_LOG}"
+import io, sys
+
+page, frag = sys.argv[1], sys.argv[2]
+html = io.open(page, encoding="utf-8", errors="replace").read()
+if "miproxy-panel-back" in html:
+    print("skip")
+    sys.exit(0)
+snippet = io.open(frag, encoding="utf-8").read()
+idx = html.lower().rfind("</body>")
+html = (html[:idx] + snippet + html[idx:]) if idx >= 0 else (html + snippet)
+io.open(page, "w", encoding="utf-8").write(html)
+print("done")
+PYEOF
+)
+        case "${state}" in
+            done) log_msg "  已在 ${name} 面板注入返回按钮" ;;
+            skip) : ;;
+            *)    log_msg "  ⚠️ ${name} 面板注入返回按钮失败（详见 config_callback.log）" ;;
+        esac
+    done
+}
+inject_panel_back
 
 [ -d "${APP_DEST}/data" ] && for f in geoip.dat geosite.dat Country.mmdb; do
     [ -f "${APP_DEST}/data/${f}" ] && cp -f "${APP_DEST}/data/${f}" "${VAR_DIR}/${f}" && chmod 666 "${VAR_DIR}/${f}" 2>/dev/null
@@ -293,5 +335,5 @@ chmod 666 "${TRIM_PKGETC}/settings.conf" 2>/dev/null
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bash "${SCRIPT_DIR}/main" start 2>>"${DEBUG_LOG}" && log_msg "✅ miproxy 启动成功" || log_msg "⚠️  miproxy 启动失败"
-log_msg "===== install_callback v9 完成 ====="
+log_msg "===== install_callback v10 完成 ====="
 exit 0

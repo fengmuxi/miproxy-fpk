@@ -96,6 +96,10 @@
 
 > 面板打不开时先确认服务已启动（`info.log` 出现「miproxy 启动完成」），并检查 9090 端口是否被占用。
 
+三个界面之间可以互相往返：面板选择页点卡片进入各面板；三个界面**左下角**都有 **「‹ 面板」** 悬浮按钮，点一下回到选择页（Zashboard / MetaCubeXD 的按钮由安装时注入，见下方说明）。
+
+> 🔧 两个第三方面板是独立的前端产物，MiProxy 不修改它们的源码。安装/升级时会往数据目录里的 `ui/zashboard/index.html`、`ui/metacubexd/index.html` 注入一段自包含的 HTML（样式内联、无外部资源，带 `miproxy-panel-back` 标记且可重复执行），所以升级面板本身不会与它冲突，也不会出现两个按钮。如果你自己替换了面板文件，重装一次应用即可补回。
+
 ### 2. 配置订阅
 
 - 入口：fnOS 应用中心 → MiProxy → **「配置」** → 「订阅管理」；或管理界面（9091）的「订阅管理」卡片。
@@ -548,7 +552,7 @@ git push origin v2.8.1
 >   -H "Authorization: Bearer $GITHUB_TOKEN" \
 >   -H "Accept: application/vnd.github+json" \
 >   https://api.github.com/repos/<owner>/<repo>/actions/workflows/build-release.yml/dispatches \
->   -d '{"ref":"main","inputs":{"version":"2.8.2"}}'
+>   -d '{"ref":"main","inputs":{"version":"2.8.3"}}'
 > ```
 >
 > 用 API 触发时请让 `version` 与 tag 保持一致。另外若 tag 已经指向 HEAD，`changes` 作业的 `git diff` 为空，Release 正文的「变更详情」会是空白，需要手工补写。
@@ -618,6 +622,9 @@ changes ──┬─→ build-x86 ──┐
 ---
 
 ## 更新日志
+
+### v2.8.3
+- ✨ **两个第三方面板也能返回了**：Zashboard / MetaCubeXD 左下角新增「‹ 面板」悬浮按钮，一点回到面板选择页（此前只有自带管理页有「← 面板」，进到这两个面板里就只能手敲地址栏回去）。按钮由 `install_callback` 在安装时注入到数据目录里的面板 `index.html`，片段单独放在 `app/ui/panel-back.html`：样式内联、无外部依赖、带标记可重复执行，面板自身升级不会被它影响，也不会叠加出两个
 
 ### v2.8.2
 - 🐛 修复（重要）：**安装/升级完保存配置报「找不到 config_callback 脚本」**。fnOS 会先在 `/vol1/appcenter-downloads/<包名>` 解包并从中执行安装回调，回调拉起 `main`、`main` 再拉起管理服务，于是管理服务的脚本目录指向那个**装完就会被清理**的临时目录；进程还在，页面照常显示，但一切脚本查找都失败——表现正是「页面正常、一保存就报错」，而 v2.8.1 之前它还会被误当成「配置没生效」。现在运行期脚本（`main` / `admin_server.py` / `config_callback` / `refresh_sub`）在每次启动时比对同步到 `/vol1/@appdata/miproxy/cmd/`，管理服务优先从那里启动；同时脚本查找改为依次尝试「数据目录 → 安装目录 → `/var/apps` → `/var/packages` → 脚本自身目录」，不再只认 `__file__` 的兄弟目录
