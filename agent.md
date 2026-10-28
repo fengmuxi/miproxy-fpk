@@ -130,7 +130,7 @@ miproxy-fpk/
 
 前端 `app/ui/admin/index.html`（单文件，原生 JS，无构建），后端 `cmd/admin_server.py`（Python3 标准库，**不引入任何第三方依赖**，因为 fnOS 上只保证有 python3）。
 
-**页面结构**：单文件内用 **hash 路由**分 5 个视图（`#/overview`、`#/subscriptions`、`#/proxy`、`#/kernel`、`#/logs`），顶部 sticky 菜单切换，`<section class="view" id="view-xxx">` 靠 `.active` 类显示/隐藏，不会真的跳页（保持登录态与状态，刷新/收藏/前进后退都可用）。新增页面：①在 `#views` 里加 section ②在 `#navTabs` 加 `<a href="#/xxx" data-view="xxx">` ③在 `VIEW_LOADERS` 里加同名键（决定进入时拉哪些数据）。注意：**每个视图只加载自己需要的数据**，日志自动刷新定时器必须在离开日志页时 `stopAutoLog()`，否则后台空转。
+**页面结构**：单文件内用 **hash 路由**分 6 个视图（`#/overview`、`#/subscriptions`、`#/proxy`、`#/nodes`、`#/kernel`、`#/logs`），顶部 sticky 菜单切换（菜单最左的「← 面板」是跳转到 mihomo 面板的外链，不是视图），`<section class="view" id="view-xxx">` 靠 `.active` 类显示/隐藏，不会真的跳页（保持登录态与状态，刷新/收藏/前进后退都可用）。新增页面：①在 `#views` 里加 section ②在 `#navTabs` 加 `<a class="tab" href="#/xxx" data-view="xxx">` ③在 `VIEW_LOADERS` 里加同名键（决定进入时拉哪些数据）。注意：**每个视图只加载自己需要的数据**，日志自动刷新定时器必须在离开日志页时 `stopAutoLog()`，否则后台空转。
 
 **部署路径**：`install_callback` 会把 `app/ui/admin/` 拷到 `${TRIM_PKGVAR}/ui/admin/`；服务端按 `VAR_DIR/ui/admin` → `APP_DEST/ui/admin` 顺序找。
 
@@ -144,6 +144,8 @@ miproxy-fpk/
 | POST | `/api/settings` | 校验 → 以 `wizard_*` 环境变量调 `config_callback` → 返回 rc、内核状态、`info.log` 尾部。请求带 `active_sub_id` 时会按清单校准 `sub_*`，防止前端旧状态覆盖订阅 |
 | GET | `/api/subscriptions` | 订阅清单 + `active_id`（以 settings.conf 反查；向导里配的订阅不在清单时会合成 `legacy` 条目） |
 | POST | `/api/subscriptions` | 保存清单；**仅当启用项变化**才调 `config_callback` 重生成配置并重启（`applied` 字段告诉前端） |
+| GET | `/api/nodes` | 解析 `config.yaml` 的 `proxies` 得节点清单（名称/类型/server/port/udp/延迟），并合并内核 `/proxies` 的 `history[-1].delay`；`kernel_running` 告知能否实测 |
+| POST | `/api/nodes/delay` | 并发测速：`{names:[], url?, timeout?}` → `{results:{name:{delay,error}}}`。只读，**不走 `_write_blocked()`**；内核未运行返回 409 |
 | GET | `/api/logs?name=&lines=` | 日志尾部，`name` 必须在 `LOG_WHITELIST` 白名单内 |
 | POST | `/api/refresh` | 调 `refresh_sub once`（刷新并应用） |
 | GET | `/api/kernel` | 当前/内置内核版本、架构、备份列表、缓存的最新版本、`kernel.json` 里的镜像前缀、当前任务快照 |
@@ -154,6 +156,7 @@ miproxy-fpk/
 | POST | `/api/kernel/config` | 保存下载镜像前缀（只对 `github.com` / `api.github.com` 等官方域名生效） |
 
 **鉴权模型**：令牌 = `settings.conf` 的 `wizard_secret`（缺失则用 `wizard_admin_token`）；两者都空则**开放访问**（局域网）。请求头 `X-Admin-Token` 或 `Authorization: Bearer`。前端把令牌存 `localStorage`。
+注意区分两套密钥：**管理接口的令牌**来自 `settings.conf`，而**访问内核控制端口**（`/proxies`、`/proxies/{n}/delay`、`-v` 版本探测等）要用 `config.yaml` 里的 `secret`——见 §9.28。
 
 **必须遵守的四条实现约定**：
 1. **`MIPROXY_KEEP_ADMIN=1`**：管理服务下发配置时会触发 `config_callback` → `main stop/start`。若不停用该开关，`stop_admin` 会把管理服务自己杀掉，导致请求中断、前端永远等不到响应。所有由管理服务派生的 `config_callback` / `refresh_sub` 调用都必须带这个环境变量。
@@ -194,7 +197,7 @@ miproxy-fpk/
 13. **内核操作的存活判定走 `main status`**，不要自己读 `app.pid` 再 `pid_alive()`：pid 文件的语义由 `main` 维护（Linux 是真实 pid，Windows 本地调试时是 MSYS pid），两套命名空间混用会得到「明明起来了却判定失败」的假故障（本轮踩过，导致升级后误判失败并回滚）。
 14. **`install_callback` 不再无条件覆盖内核**：内置内核始终另存 `target/mihomo.bundled`，只在 `target/mihomo` 缺失时补齐。否则用户手动升级的内核会在升级 `.fpk` 后被悄悄换回去。
 15. **下载地址不接受任意 URL**：`/api/kernel/install` 只接受 `version`（拼 `KERNEL_DL_BASE`）、`file`（本机路径）或 `bundled`；资产名还要过 `^mihomo-linux-` 正则。镜像前缀只对 `MIRROR_HOSTS` 里的官方域名拼接（`https://ghfast.top/` 这一类服务认的是原始 GitHub URL），给自建/本地地址套前缀只会拼出 404。
-16. **无面板密钥时写操作一律拒绝**：`do_POST` 里 `_write_blocked()` 会对所有 POST 返回 403（`need_token: true`），前端据此弹引导。**新增任何 POST 路由都必须放在这两个检查之后**，否则等于开了个未认证入口——无密钥 + `/api/kernel/install` + 任意 `mirror` 就是一条完整的远程代码执行链。
+16. **无面板密钥时写操作一律拒绝**：`do_POST` 里 `_write_blocked()` 会对所有 POST 返回 403（`need_token: true`），前端据此弹引导。**新增任何 POST 路由都必须放在这两个检查之后**，否则等于开了个未认证入口——无密钥 + `/api/kernel/install` + 任意 `mirror` 就是一条完整的远程代码执行链。唯一的例外是**明确只读**的 POST（当前只有 `/api/nodes/delay`：它只调内核的 delay 接口，不写配置、不动进程），这类可以放在 `_write_blocked()` 之前放行——毕竟刚装好还没填密钥时，用户连「节点通不通」都验证不了就没法用；但它**仍必须在 `_authorized()` 之后**，设了密钥就得验。
 17. **`settings.conf` 的读取必须同时裁掉 `\r` 和 `\n`**（`tr -d '\r\n'`）：只删 `\n` 时，CRLF 行尾会让 `sub_type` 变成 `remote\r`，比较失败，表现为「设了远程订阅却不刷新」。
 18. **`refresh_sub` 的三个自我保护**：锁文件要写 PID 并支持残留清理（`lock_is_stale`，否则一次异常退出会让自动刷新**永久**跳过）；`get_interval_seconds` 有 60 秒下限（否则 `sleep 0` 让守护进程满载空转）；`refresh_sub` 复制到数据目录后要**每次比对同步**（只在缺失时复制的话，升级 `.fpk` 后旧副本会一直生效）。
 19. **卸载链路两个红线**：`uninstall_init` 只能用 `pkill -f "${TRIM_PKGVAR}/target/mihomo"`（`pkill -f mihomo` 会误杀同机其它代理应用的进程）；`uninstall_callback` 的 `rm -rf` 必须过 `is_app_dir()`（路径含 `miproxy`）白名单，防止 `TRIM_*` 被误设成卷根目录时删空整卷。
@@ -205,6 +208,9 @@ miproxy-fpk/
 24. **`/api/status` 的 `panel_port`** 来自 `settings.conf` 的 `wizard_api_port`（mihomo 控制端口，面板页 `external-ui` 挂在它的 `/ui/`）。新加需要跨端口跳转的入口时复用它，别再往 HTML 里写死 9090/9091。
 25. **`config_callback` 的退出码是「是否真的生效」的唯一凭据**：它过去不管内核重启成败都 `exit 0`，于是「配置已保存」和「配置没生效」在接口层长得一模一样——这就是「界面上启用了订阅、config.yaml 却没生效」的根。现在内核重启失败会返回 **3**，`_apply_settings_locked` 据此返回 500 并附 `config_updated` / `kernel_restarted` / `kernel_pid_before|after` 三个事实。**新增任何调用 config_callback 的路径，都必须检查返回码，不能只看有没有报错输出。** 另外 `MIPROXY_NO_RESTART=1`（refresh_sub 定时刷新用）仍然 `exit 0`，因为重启由调用方负责。
 26. **前端判断「应用成功」不能只看 HTTP 状态**：`applyVerdict()` 会依次看 `ok` → `config_updated` → `kernel_restarted`。只改 DOM 提示而不核对这三项，就会出现「页面说已启用了、节点其实一个都没进去」的假成功。
+27. **节点清单要解析 `config.yaml`，不要读订阅缓存**：缓存里有节点 ≠ 内核加载了节点（节点是内嵌进 `config.yaml` 的，见 §9.11）。节点页若图省事去读 `proxy_providers/subscription.yaml`，「订阅启用了但配置没生效」这个最常见的故障就会被它掩盖成「一切正常」。同理，延迟的初值只能来自内核 `history`（可能很旧），页面上要说清「测速才是现测」，否则用户会拿几天前的数字判断节点死活。
+28. **访问内核控制端口用 `config.yaml` 的 `secret`，不是 `wizard_secret`**：`wizard_secret` 是「期望值」，`config.yaml` 的 `secret` 是「内核实际生效值」。用户改了面板密钥但没重新应用配置时两者不一致，按设置项去请求必然 401 → 节点页整页 `unauthorized`，看起来像内核坏了。`_mihomo_secret()` 因此优先读 `config.yaml`，读不到才退回设置项。另外调内核 API 时必须 `ProxyHandler({})` 显式禁掉环境变量里的 `http_proxy`：目标是 `127.0.0.1`，走代理只会绕一圈失败；测速超时内核返回 **408** 且 body 里有 `{"message":...}`，这是有效信息，别当异常吞掉。
+29. **并发测速要设上限**：`test_nodes()` 用 `ThreadPoolExecutor(max_workers=6)`，单个 4 秒超时，单批最多 300 个。要是不限并发，一个 500 节点的订阅点「全部测速」会瞬间打满文件描述符和内核连接数，连正常上网都受影响。单点失败只影响该节点（`results[name].error`），不能让一个超时把整批拖垮。
 
 ---
 

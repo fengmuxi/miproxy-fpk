@@ -44,8 +44,9 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 # ---------------------------------------------------------------- 路径与常量
 
@@ -541,6 +542,265 @@ def _do_refresh_locked(script):
         "returncode": proc.returncode,
         "log": safe_tail(os.path.join(VAR_DIR, "refresh_sub.log"), 60),
     }
+
+
+# ---------------------------------------------------------------- 节点列表与延迟测试
+#
+# 节点清单来自 config.yaml 的 proxies 段（也就是「实际生效」的那份，不是订阅缓存），
+# 实时状态与延迟尽量走 mihomo 的 external-controller —— 那才是内核眼里的真相。
+
+NODE_TEST_URL_DEFAULT = "http://www.gstatic.com/generate_204"
+NODE_TEST_TIMEOUT_MS = 4000
+MAX_NODE_TESTS = 300
+BUILTIN_PROXIES = {"DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL"}
+
+
+def _api_port():
+    try:
+        return int((read_settings().get("wizard_api_port") or "9090").strip() or 9090)
+    except (TypeError, ValueError):
+        return 9090
+
+
+def _mihomo_secret():
+    """调用内核控制端口用的密钥：以 config.yaml 里的 secret 为准。
+
+    设置项 wizard_secret 是「期望值」，config.yaml 的 secret 才是「内核实际生效值」。
+    用户在 fnOS 里改了面板密钥、但没重新应用配置时，两者会不一致；此时按设置项
+    去请求必然 401，节点页会整页显示 unauthorized，看起来像内核坏了。
+    所以优先读内核真正在用的那份，读不到再退回设置项。
+    """
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("secret:"):
+                    value = line[len("secret:"):].strip()
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                        value = value[1:-1]
+                    return value
+    except OSError:
+        pass
+    return (read_settings().get("wizard_secret") or "").strip()
+
+
+def _mihomo_api(path, timeout=4.0):
+    """调用 mihomo external-controller，失败返回 None（内核没起、密钥不对、超时都算失败）。
+
+    注意：显式禁用环境变量里的 http_proxy —— 这是本机回环地址，
+    走代理只会绕一圈然后失败。
+    """
+    url = "http://127.0.0.1:%d%s" % (_api_port(), path)
+    req = urllib.request.Request(url)
+    secret = _mihomo_secret()
+    if secret:
+        req.add_header("Authorization", "Bearer " + secret)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        # 测速超时是 408，body 里带 {"message": "..."}，这是有效信息不能丢
+        try:
+            return json.loads(exc.read().decode("utf-8", "replace"))
+        except (ValueError, OSError):
+            return None
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def _yaml_scalar(text):
+    value = (text or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def _split_flow_map(body):
+    """把 {name: "a", type: ss, server: 1.2.3.4, port: 443} 拆成 [(k, v)]。
+    逗号只在引号外才算分隔符，避免 name 里带逗号被切坏。"""
+    parts, buf, quote_ch = [], [], None
+    for ch in body:
+        if quote_ch:
+            buf.append(ch)
+            if ch == quote_ch:
+                quote_ch = None
+        elif ch in "\"'":
+            quote_ch = ch
+            buf.append(ch)
+        elif ch == ",":
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        parts.append("".join(buf))
+    pairs = []
+    for part in parts:
+        if ":" not in part:
+            continue
+        key, val = part.split(":", 1)
+        if key.strip():
+            pairs.append((key.strip(), _yaml_scalar(val)))
+    return pairs
+
+
+def parse_config_proxies():
+    """从 config.yaml 的 proxies 段读出节点基础信息（name/type/server/port）。
+
+    只实现够用的 YAML 子集，不引第三方依赖，两种常见写法都支持：
+        - {name: "香港01", type: ss, server: hk.example.com, port: 443}
+        - name: "香港01"
+          type: ss
+          server: hk.example.com
+          port: 443
+    """
+    try:
+        with open(CONFIG_FILE, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return []
+
+    nodes, cur, in_block = [], None, False
+    for raw in lines:
+        if not in_block:
+            if raw.strip() == "proxies:":
+                in_block = True
+            continue
+        # 行首顶格的键意味着 proxies 段结束（rules: / proxy-groups: ...）
+        if raw and not raw[0].isspace():
+            break
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("-"):
+            body = line[1:].strip()
+            cur = {}
+            nodes.append(cur)
+            if body.startswith("{"):
+                for key, val in _split_flow_map(body.strip().strip("{}")):
+                    cur[key] = val
+            elif ":" in body:
+                key, val = body.split(":", 1)
+                cur[key.strip()] = _yaml_scalar(val)
+            else:
+                # 「- 」单独一行、字段全在下一层缩进里
+                cur = {}
+        elif cur is not None and ":" in line:
+            key, val = line.split(":", 1)
+            key = key.strip()
+            if key and key not in cur:
+                cur[key] = _yaml_scalar(val)
+
+    out = []
+    for idx, node in enumerate(nodes, 1):
+        name = str(node.get("name") or "").strip()
+        if not name or name in BUILTIN_PROXIES:
+            continue
+        out.append({
+            "index": idx,
+            "name": name,
+            "type": str(node.get("type") or "").strip(),
+            "server": str(node.get("server") or "").strip(),
+            "port": str(node.get("port") or "").strip(),
+            "network": str(node.get("network") or "").strip(),
+            "udp": str(node.get("udp") or "").strip().lower() in ("true", "yes", "1"),
+        })
+    return out
+
+
+def build_nodes():
+    """节点清单 + 内核侧实时延迟（history 最后一条）。"""
+    nodes = parse_config_proxies()
+    kernel_alive = pid_alive(read_pid(MIHOMO_PID_FILE))
+
+    live = {}
+    if kernel_alive:
+        data = _mihomo_api("/proxies")
+        for name, item in ((data or {}).get("proxies") or {}).items():
+            if not isinstance(item, dict):
+                continue
+            delay = None
+            hist = item.get("history")
+            if isinstance(hist, list) and hist:
+                try:
+                    last = hist[-1]
+                    if isinstance(last, dict) and last.get("delay"):
+                        delay = int(last["delay"])
+                except (TypeError, ValueError, AttributeError):
+                    delay = None
+            live[name] = {"delay": delay, "alive": bool(item.get("alive")), "type": item.get("type") or ""}
+
+    for node in nodes:
+        info = live.get(node["name"])
+        node["delay"] = info["delay"] if info else None
+        node["alive"] = info["alive"] if info else None
+        if info and not node["type"]:
+            node["type"] = info["type"]
+
+    sub = effective_subs()
+    sub_name = ""
+    for item in sub["items"]:
+        if item["id"] == sub["active_id"]:
+            sub_name = item.get("name") or ""
+            break
+
+    return {
+        "ok": True,
+        "kernel_running": kernel_alive,
+        "subscription": sub_name,
+        "sub_type": sub.get("current", {}).get("type", "none"),
+        "total": len(nodes),
+        "nodes": nodes,
+        "test_url": NODE_TEST_URL_DEFAULT,
+    }
+
+
+def test_nodes(names, url=None, timeout_ms=NODE_TEST_TIMEOUT_MS):
+    """通过内核实际发请求测延迟（mihomo 的 /proxies/{name}/delay）。"""
+    if not pid_alive(read_pid(MIHOMO_PID_FILE)):
+        return 409, {"ok": False, "error": "内核未运行，无法测速——请先在「概览」页启动内核"}
+
+    clean, seen = [], set()
+    for item in names or []:
+        name = str(item).strip()
+        if name and name not in seen:
+            seen.add(name)
+            clean.append(name)
+    clean = clean[:MAX_NODE_TESTS]
+    if not clean:
+        return 400, {"ok": False, "error": "没有需要测试的节点"}
+
+    url = (url or NODE_TEST_URL_DEFAULT).strip()
+    if not re.match(r"^https?://", url) or len(url) > 200:
+        return 400, {"ok": False, "error": "测试地址需以 http:// 或 https:// 开头且不超过 200 字符"}
+
+    try:
+        timeout_ms = max(500, min(15000, int(timeout_ms)))
+    except (TypeError, ValueError):
+        timeout_ms = NODE_TEST_TIMEOUT_MS
+
+    def one(name):
+        query = "/proxies/%s/delay?url=%s&timeout=%d" % (
+            quote(name, safe=""), quote(url, safe=""), timeout_ms,
+        )
+        data = _mihomo_api(query, timeout=timeout_ms / 1000.0 + 4)
+        if not isinstance(data, dict):
+            return name, {"delay": 0, "error": "内核无响应"}
+        try:
+            delay = int(data.get("delay") or 0)
+        except (TypeError, ValueError):
+            delay = 0
+        if delay > 0:
+            return name, {"delay": delay, "error": ""}
+        message = str(data.get("message") or "").strip()
+        return name, {"delay": 0, "error": message or "超时"}
+
+    results = {}
+    # 并发 6：再高会把内核打满并互相拖慢，全量测速反而更慢
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for name, result in pool.map(one, clean):
+            results[name] = result
+    return 200, {"ok": True, "url": url, "timeout": timeout_ms, "results": results}
 
 
 # ---------------------------------------------------------------- 内核管理（mihomo 检查更新 / 切换 / 升级）
@@ -1371,6 +1631,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/subscriptions":
             return self._json(200, effective_subs())
 
+        if path == "/api/nodes":
+            return self._json(200, build_nodes())
+
         if path == "/api/kernel":
             return self._json(200, kernel_overview())
 
@@ -1396,6 +1659,22 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if not self._authorized():
             return self._json(401, {"error": "未授权：请提供面板密钥"})
+
+        # 测速是只读操作（不写配置、不动内核进程），未设面板密钥时也放行：
+        # 否则刚装好还没填密钥的用户连「节点通不通」都验证不了。
+        if parsed.path == "/api/nodes/delay":
+            length = to_int(self.headers.get("Content-Length", 0), 0)
+            if length <= 0 or length > MAX_BODY:
+                return self._json(400, {"error": "请求体为空或过大"})
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            except Exception as exc:  # noqa: BLE001
+                return self._json(400, {"error": "JSON 解析失败: %s" % exc})
+            if not isinstance(payload, dict):
+                return self._json(400, {"error": "请求体必须是 JSON 对象"})
+            code, resp = test_nodes(payload.get("names"), payload.get("url"), payload.get("timeout"))
+            return self._json(code, resp)
+
         if self._write_blocked():
             return
 

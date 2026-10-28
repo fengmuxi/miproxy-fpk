@@ -138,6 +138,28 @@
   .apply-log{max-height:220px;overflow:auto;margin:8px 0 0;padding:10px 12px;border-radius:9px;
              background:#0f1115;color:#cfd3e1;font-size:12px;line-height:1.55;white-space:pre-wrap}
 
+  /* 节点列表 */
+  .node-toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:12px}
+  .node-toolbar input[type=text]{flex:1 1 260px;max-width:420px}
+  .node-table-wrap{max-height:56vh;overflow:auto;border:1px solid var(--line);border-radius:10px}
+  .node-table{width:100%;border-collapse:collapse;font-size:13px}
+  .node-table th{position:sticky;top:0;z-index:1;background:#f5f6fb;color:#5b6072;text-align:left;
+                 font-weight:600;padding:9px 12px;white-space:nowrap;border-bottom:1px solid var(--line)}
+  .node-table td{padding:9px 12px;border-top:1px solid var(--line);vertical-align:middle}
+  .node-table tbody tr:first-child td{border-top:0}
+  .node-table tbody tr:hover{background:#fafbff}
+  .node-name{font-weight:600;max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .node-addr{color:var(--muted);font-family:ui-monospace,Consolas,"Courier New",monospace;font-size:12px;
+             max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .node-type{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef0fb;color:#4b52a8;
+             font-size:12px;font-weight:600}
+  .delay{font-variant-numeric:tabular-nums;font-weight:700}
+  .delay.ok{color:#16a34a}
+  .delay.mid{color:#d97706}
+  .delay.bad{color:#dc2626}
+  .delay.na{color:#9aa0b4;font-weight:500}
+  .node-table .btn.mini{padding:5px 10px;font-size:12.5px}
+
   /* 内核 */
   .kgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px 18px;margin-bottom:14px}
   .kgrid .k-item{min-width:0}
@@ -177,6 +199,7 @@
       <a class="tab active" href="#/overview" data-view="overview">概览</a>
       <a class="tab" href="#/subscriptions" data-view="subscriptions">订阅</a>
       <a class="tab" href="#/proxy" data-view="proxy">代理与面板</a>
+      <a class="tab" href="#/nodes" data-view="nodes">节点</a>
       <a class="tab" href="#/kernel" data-view="kernel">内核</a>
       <a class="tab" href="#/logs" data-view="logs">日志</a>
     </nav>
@@ -333,6 +356,41 @@
     <div class="actions">
       <button class="btn primary" id="saveBtn" type="button">保存并应用</button>
       <span class="muted" id="saveHint">将写入 settings.conf 并重启内核</span>
+    </div>
+  </div>
+
+  </section>
+
+  <!-- ==================== 节点 ==================== -->
+  <section class="view" id="view-nodes">
+
+  <div class="card">
+    <h2>订阅节点 <span class="muted" id="nodeSubTag"></span></h2>
+    <div class="hint" id="nodeHint">节点清单来自 config.yaml（实际生效的那份），延迟由内核实测。</div>
+
+    <div class="node-toolbar">
+      <input type="text" id="nodeSearch" placeholder="搜索名称 / 类型 / 地址…">
+      <button class="btn primary" id="nodeTestAllBtn" type="button">全部测速</button>
+      <button class="btn ghost" id="nodeReloadBtn" type="button">刷新列表</button>
+      <label class="muted"><input type="checkbox" id="nodeOnlyAlive"> 只看可用</label>
+    </div>
+
+    <div class="chips" id="nodeStats"></div>
+
+    <div class="node-table-wrap">
+      <table class="node-table">
+        <thead>
+          <tr>
+            <th style="width:44px">#</th>
+            <th>节点</th>
+            <th style="width:88px">类型</th>
+            <th>地址</th>
+            <th style="width:96px">延迟</th>
+            <th style="width:80px"></th>
+          </tr>
+        </thead>
+        <tbody id="nodeRows"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
+      </table>
     </div>
   </div>
 
@@ -1128,6 +1186,108 @@
     });
   }
 
+  // ---------------------------------------------------------------- 节点列表与测速
+  var nodeState = { items: [], testing: false, kernelRunning: false };
+
+  function delayClass(ms) {
+    if (ms === null || ms === undefined) return "na";
+    if (!ms) return "bad";
+    return ms < 200 ? "ok" : (ms < 500 ? "mid" : "bad");
+  }
+
+  function delayText(ms) {
+    if (ms === null || ms === undefined) return "—";
+    if (!ms) return "超时";
+    return ms + " ms";
+  }
+
+  function renderNodes() {
+    var q = ($("nodeSearch").value || "").trim().toLowerCase();
+    var onlyAlive = $("nodeOnlyAlive").checked;
+    var all = nodeState.items || [];
+    var items = [];
+    for (var i = 0; i < all.length; i++) {
+      var n = all[i];
+      if (q && (n.name + " " + n.type + " " + n.server + " " + n.port).toLowerCase().indexOf(q) < 0) continue;
+      if (onlyAlive && !(n.delay > 0)) continue;
+      items.push(n);
+    }
+
+    var html = "";
+    for (var k = 0; k < items.length; k++) {
+      var it = items[k];
+      var addr = (it.server || "—") + (it.port ? ":" + it.port : "");
+      html += '<tr>' +
+        '<td class="muted">' + (k + 1) + '</td>' +
+        '<td><div class="node-name" title="' + esc(it.name) + '">' + esc(it.name) + '</div></td>' +
+        '<td><span class="node-type">' + esc(String(it.type || "?").toUpperCase()) + '</span></td>' +
+        '<td><div class="node-addr" title="' + esc(addr) + '">' + esc(addr) + '</div></td>' +
+        '<td><span class="delay ' + delayClass(it.delay) + '">' + delayText(it.delay) + '</span></td>' +
+        '<td><button class="btn mini ghost" type="button" data-act="test" data-name="' + esc(it.name) + '">测速</button></td>' +
+        '</tr>';
+    }
+    if (!items.length) {
+      html = '<tr><td colspan="6" class="muted">' +
+        (all.length ? "没有匹配的节点" : "还没有节点——请先在「订阅」页启用一个订阅") + '</td></tr>';
+    }
+    $("nodeRows").innerHTML = html;
+
+    var tested = 0, alive = 0, sum = 0;
+    for (var j = 0; j < all.length; j++) {
+      var d = all[j].delay;
+      if (d === null || d === undefined) continue;
+      tested++;
+      if (d > 0) { alive++; sum += d; }
+    }
+    var chips = '<div class="chip">共 <b>' + all.length + '</b> 个节点</div>' +
+      '<div class="chip">已测 <b>' + tested + '</b></div>' +
+      '<div class="chip">可用 <b>' + alive + '</b></div>' +
+      '<div class="chip">平均 <b>' + (alive ? Math.round(sum / alive) + " ms" : "—") + '</b></div>';
+    if (!nodeState.kernelRunning) chips += '<div class="chip">内核未运行，无法实测</div>';
+    $("nodeStats").innerHTML = chips;
+  }
+
+  function loadNodes() {
+    return api("/api/nodes").then(function (r) {
+      nodeState.items = (r && r.nodes) || [];
+      nodeState.kernelRunning = !!(r && r.kernel_running);
+      $("nodeSubTag").textContent = (r && r.subscription) ? "· " + r.subscription : "";
+      $("nodeHint").textContent = nodeState.items.length
+        ? "节点清单取自 config.yaml（实际生效的那份），延迟由内核真实发请求测得，测试地址 " + (r.test_url || "") + "。"
+        : "当前 config.yaml 里没有节点——请先在「订阅」页启用一个订阅并应用。";
+      renderNodes();
+    }).catch(function (e) {
+      if (e.message.indexOf("未授权") < 0) toast("读取节点失败：" + e.message, "err");
+    });
+  }
+
+  function testNodes(names, btn, busyLabel) {
+    if (nodeState.testing) { toast("正在测速，请稍候…", "err"); return Promise.resolve(); }
+    if (!names || !names.length) { toast("没有可测速的节点", "err"); return Promise.resolve(); }
+    nodeState.testing = true;
+    var oldLabel = btn ? btn.textContent : "";
+    if (btn) { btn.disabled = true; btn.textContent = busyLabel || "测速中…"; }
+    return api("/api/nodes/delay", {
+      method: "POST",
+      body: JSON.stringify({ names: names })
+    }).then(function (r) {
+      var results = (r && r.results) || {};
+      for (var i = 0; i < nodeState.items.length; i++) {
+        var hit = results[nodeState.items[i].name];
+        if (hit) nodeState.items[i].delay = hit.delay || 0;
+      }
+      renderNodes();
+      var ok = 0;
+      for (var key in results) if (results[key].delay > 0) ok++;
+      toast("测速完成：" + ok + "/" + names.length + " 个可用", ok ? "ok" : "err");
+    }).catch(function (e) {
+      toast("测速失败：" + e.message, "err");
+    }).finally(function () {
+      nodeState.testing = false;
+      if (btn) { btn.disabled = false; btn.textContent = oldLabel; }
+    });
+  }
+
   // ---------------------------------------------------------------- 顶部菜单路由
   // ⚠️ 不要把「当前是哪个页面」只交给 location.hash：
   // fnOS 桌面窗口里页面可能是 sandbox / opaque-origin 文档（about:srcdoc 之类），
@@ -1139,6 +1299,7 @@
     overview: function () { loadStatus(true); loadSubs(); loadSettings(); loadOverview(); },
     subscriptions: function () { loadSubs(); loadSettings(); },
     proxy: function () { loadSettings(); },
+    nodes: function () { loadNodes(); },
     kernel: function () { loadKernel(); },
     logs: function () { loadLogs(); }
   };
@@ -1252,6 +1413,20 @@
       loadStatus(true);
       route();
     };
+
+    // 节点：搜索/筛选只重绘本地数据，测速走一次接口
+    $("nodeReloadBtn").onclick = loadNodes;
+    $("nodeSearch").oninput = renderNodes;
+    $("nodeOnlyAlive").onchange = renderNodes;
+    $("nodeTestAllBtn").onclick = function () {
+      var names = (nodeState.items || []).map(function (n) { return n.name; });
+      testNodes(names, this, "测速中…");
+    };
+    $("nodeRows").addEventListener("click", function (ev) {
+      var el = ev.target;
+      if (!el || !el.getAttribute || el.getAttribute("data-act") !== "test") return;
+      testNodes([el.getAttribute("data-name")], el, "…");
+    });
 
     // 顶部菜单：显式接管点击，不依赖 <a href="#/x"> 的默认导航
     // 挂在 document 的捕获阶段：万一外层壳程序（fnOS 桌面）在冒泡阶段拦链接，
