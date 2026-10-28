@@ -65,7 +65,27 @@ download_subscription() {
     fi
     rm -f "${tmp}"
 
-    # 两次都不是 Clash YAML：保留第一次的结果（可能是 base64，留着给诊断）
-    mv -f "${saved}" "${out}"
+    # 两次都不是 Clash YAML：先尝试当作 v2ray/v2rayA 类订阅（base64 或明文链接列表）
+    # 转换成 Clash 格式 —— 转换成功就正常采用，下游零改动。
+    # 找转换脚本：与调用方脚本同目录 → 数据目录（refresh_sub 复制运行的场景）。
+    # 注意本文件是被 source 的，$0 是调用者，必须用 BASH_SOURCE 定位自身。
+    CONVERT=""
+    for _c in "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sub_convert.py" \
+              "${TRIM_PKGVAR:-}/cmd/sub_convert.py" \
+              "${TRIM_PKGVAR:-}/sub_convert.py"; do
+        [ -n "${_c}" ] && [ -f "${_c}" ] && CONVERT="${_c}" && break
+    done
+    unset _c
+    if [ -n "${CONVERT}" ] && command -v python3 >/dev/null 2>&1; then
+        if python3 "${CONVERT}" "${saved}" "${out}" 1>&2 2>>"${DEBUG_LOG:-/dev/null}"; then
+            rm -f "${saved}"
+            log_msg "  ✅ 订阅为 v2ray/链接列表格式，已自动转换为 Clash 格式（$(grep -c '^  - ' "${out}" 2>/dev/null || echo '?') 个节点）"
+            return 0
+        fi
+    fi
+
+    # 转换不可用/失败：绝不能覆盖已有缓存（可能是旧订阅的可用节点），
+    # 只把无效内容另存为 .invalid 供诊断 —— 否则「切换订阅失败回滚」后连旧缓存都没了。
+    mv -f "${saved}" "${out}.invalid"
     return 2
 }

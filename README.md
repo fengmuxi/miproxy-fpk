@@ -642,6 +642,11 @@ changes ──┬─→ build-x86 ──┐
 
 ## 更新日志
 
+### v2.8.7
+- ✨ 新增：**支持 v2ray / v2rayA 类订阅格式**。订阅地址返回 base64 编码（或明文）的 vmess / vless / ss / trojan / ssr 分享链接列表时，下载入口会自动转换成 Clash/mihomo 格式再走既有流程（新增 `cmd/sub_convert.py`，纯 python3 标准库，不依赖 PyYAML）；转换在 `sub_download.sh` 统一入口完成，安装、面板保存、定时刷新三条链路零改动自动生效。vmess 支持 ws/grpc/h2 传输层与 TLS（servername/client-fingerprint），vless 支持 REALITY（public-key/short-id）、flow、ws/grpc，trojan/grpc、ss（SIP002 与旧 base64 格式）、ssr 全覆盖；不支持的传输层（kcp/quic）按节点跳过并在日志说明；重名节点自动加 `-2` 后缀；无法解析的行跳过，全部失败才判订阅无效。原生 Clash 订阅行为完全不变
+- 🐛 修复（重要）：**切换订阅时新订阅下载失败，界面显示已切到新订阅、实际生效的还是旧订阅**。原来「下载失败 → 沿用旧缓存继续走」：config.yaml 用旧节点重新生成（内容不变）、内核照常重启，但 settings.conf 已被写成**新 URL** 且退出码为 0——管理界面因此显示新订阅、报成功，代理实际跑的还是旧订阅，用户完全无从察觉。现在只要「本次是切换订阅（URL 变更）且新订阅没拿到」（下载失败或拿回的内容无法识别），config_callback 就**整体回滚**：不覆盖 config.yaml、不重写 settings.conf、不重启内核，退出码 6，管理界面明确提示「新订阅下载失败，已保留原订阅与当前配置」
+- 🐛 修复：**订阅返回内容无法识别时会覆盖掉旧缓存**（违背 sub_download.sh 自己「不覆盖已有缓存」的注释约定）。现在无效内容另存为 `subscription.yaml.invalid` 供诊断，旧缓存原样保留——否则一次坏响应就能把用户仅有的可用节点缓存毁掉
+
 ### v2.8.6
 - 🐛 修复（重要）：**重装 / 升级 `.fpk` 后会丢失面板已配置的订阅**。fnOS 升级时再次执行 `install_callback`，而它原本无条件整体重写 `settings.conf`，于是「首次装选了『暂不配置』→ 之后在面板配好远程订阅 → 更新安装又被打回 none」。现在 `install_callback` 检测到既有 `settings.conf` 时，向导给的是默认值（none / 空）就**沿用旧配置**：订阅类型、订阅链接、密钥、HTTP/API 端口、刷新间隔、管理端口与令牌全部保留；只有向导**显式**给了新值才覆盖；首次安装行为不变
 - 🐛 修复（重要）：**切换订阅（或改完配置保存）后应用直接停止，需要手动启动**。根因有二：① 旧逻辑用 `main stop` + `main start` 全家桶重启，内核到重启完成之间有十几秒窗口，fnOS 靠 `main status`（0=运行 / 3=停止）巡检，抓到这一瞬就把应用标成「已停止」；② 内核以普通 `&` 启动，是瞬态重启进程的子进程，父进程退出时被 SIGHUP 带走。现在改为 `restart-kernel`：**只重启内核进程**，管理服务与订阅刷新守护进程原地不动；重启窗口内用 `RESTART_FLAG` 标记让 `main status` 仍返回 0，fnOS 不会误判；内核启动统一加 `nohup` 脱离调用方进程树

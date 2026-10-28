@@ -197,6 +197,9 @@ miproxy-fpk/
 10. **「未启用订阅」不能再吃旧缓存**：两个 callback 抽取订阅字段前必须判断 `SUB_TYPE` 属于 `remote`/`local`（已修）。`proxy_providers/subscription.yaml` 会一直留着上一次的缓存以便快速切回，如果不加判断，`sub_type=none` 时照样会把旧节点写进 `config.yaml`，表现为「停用了但还在走代理」。
 11. **「只重启内核」不等于「配置生效」**：内核每次启动都从磁盘读 `config.yaml`，而节点是内嵌的，所以「换缓存 + 重启」重启的仍是旧配置。`refresh_sub` 的定时路径过去正是如此（已修）；判断某条链路是否真生效，只需看 `config.yaml` 内容是否变了 + 内核 PID 是否换了。
 12. **`main stop` 是「杀全族」**：它会 `stop_refresh_daemon` + `stop_admin`。所以任何「由守护进程/管理服务自己触发配置应用」的路径，都必须用 `MIPROXY_NO_RESTART=1`（刷新链路）或 `MIPROXY_KEEP_ADMIN=1`（管理链路）避免自杀。
+13. **「沿用旧缓存」只对 URL 未变成立；切换订阅（URL 变更）下载失败必须整体回滚**（v2.8.7，exit 6）：否则 config.yaml 用旧缓存节点、settings.conf 却写成新 URL，界面显示新订阅、实际跑旧订阅——「显示与生效不一致」比失败更坑。回滚 = 不覆盖 config.yaml、不重写 settings.conf、不重启内核。URL 未变时的下载失败仍可沿用旧缓存（定时刷新链路：refresh_sub 自己 fetch 失败就不会调 config_callback）。
+14. **`sub_download.sh` 的 rc=2 路径曾覆盖旧缓存**（v2.8.7 已修）：下到的内容无法识别时，先试 v2ray 转换（`sub_convert.py`），仍失败才把无效内容另存 `subscription.yaml.invalid`，绝不能 `mv` 到缓存路径——一次坏响应就能毁掉用户仅有的可用节点缓存。
+15. **v2ray/链接列表订阅在下载入口统一转换**（v2.8.7，`cmd/sub_convert.py`）：`sub_download.sh` 拿到非 Clash 内容时先尝试转换（base64 或明文的 vmess/vless/ss/trojan/ssr 链接列表 → Clash YAML，纯 python3 标准库、无 PyYAML 依赖），成功即正常返回 0，下游（install/config/refresh）零改动。转换脚本要跟 `sub_download.sh` 一起进 `main` 的 `sync_cmd_scripts()` 与 CI chmod 列表；kcp/quic 等不支持的传输层按节点跳过，全部失败才返回 2 走回滚。
 13. **内核操作的存活判定走 `main status`**，不要自己读 `app.pid` 再 `pid_alive()`：pid 文件的语义由 `main` 维护（Linux 是真实 pid，Windows 本地调试时是 MSYS pid），两套命名空间混用会得到「明明起来了却判定失败」的假故障（本轮踩过，导致升级后误判失败并回滚）。
 14. **`install_callback` 不再无条件覆盖内核**：内置内核始终另存 `target/mihomo.bundled`，只在 `target/mihomo` 缺失时补齐。否则用户手动升级的内核会在升级 `.fpk` 后被悄悄换回去。
 15. **下载地址不接受任意 URL**：`/api/kernel/install` 只接受 `version`（拼 `KERNEL_DL_BASE`）、`file`（本机路径）或 `bundled`；资产名还要过 `^mihomo-linux-` 正则。镜像前缀只对 `MIRROR_HOSTS` 里的官方域名拼接（`https://ghfast.top/` 这一类服务认的是原始 GitHub URL），给自建/本地地址套前缀只会拼出 404。

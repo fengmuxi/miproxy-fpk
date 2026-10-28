@@ -177,7 +177,7 @@ if [ "${SUB_TYPE}" = "remote" ] && [ -n "${SUB_URL}" ]; then
         if [ "${rc}" = "0" ]; then
             log_msg "  ✅ 订阅下载成功: $(stat -c%s "${SUB_CACHE_PATH}" 2>/dev/null || wc -c < "${SUB_CACHE_PATH}") bytes"
         elif [ "${rc}" = "2" ]; then
-            log_msg "  ⚠️ 订阅已下载，但不是 Clash/mihomo 格式（已保留文件供诊断）"
+            log_msg "  ⚠️ 订阅已下载，但不是 Clash/mihomo 格式（无效内容另存为 .invalid 供诊断，原缓存未被覆盖）"
         else
             # 下载失败：保留上一次的缓存。
             # 重装/升级时网络可能不通，若此时把缓存清掉，用户的节点就全没了，

@@ -176,11 +176,13 @@ if [ "${SUB_TYPE}" = "remote" ] && [ -n "${SUB_URL}" ]; then
     fi
 fi
 
+SUB_DOWNLOAD_FAILED=0
 if [ "${NEED_DOWNLOAD}" = "1" ]; then
     log_msg "下载远程订阅: ${SUB_URL}"
     progress_set "downloading" 20 "正在下载订阅信息"
     if [ -z "${SUB_URL}" ]; then
         log_msg "  ⚠️ 订阅类型为 remote 但没有订阅链接，跳过下载"
+        SUB_DOWNLOAD_FAILED=1
     elif command -v download_subscription >/dev/null 2>&1; then
         # download_subscription：0=拿到 Clash YAML，2=下到了但不是 Clash 格式
         download_subscription "${SUB_URL}" "${SUB_CACHE_PATH}"
@@ -188,9 +190,11 @@ if [ "${NEED_DOWNLOAD}" = "1" ]; then
         if [ "${rc}" = "0" ]; then
             log_msg "  ✅ 订阅下载成功: $(stat -c%s "${SUB_CACHE_PATH}" 2>/dev/null || wc -c < "${SUB_CACHE_PATH}") bytes"
         elif [ "${rc}" = "2" ]; then
-            log_msg "  ⚠️ 订阅已下载，但不是 Clash/mihomo 格式（已保留原缓存文件供诊断）"
+            log_msg "  ⚠️ 订阅已下载，但不是 Clash/mihomo 格式（无效内容已另存为 .invalid 供诊断，原缓存未被覆盖）"
+            SUB_DOWNLOAD_FAILED=1
         else
-            log_msg "  ⚠️ 订阅下载失败，使用上次缓存"
+            log_msg "  ⚠️ 订阅下载失败"
+            SUB_DOWNLOAD_FAILED=1
         fi
     else
         # 兜底：辅助脚本缺失时退回最原始的下载方式
@@ -198,10 +202,25 @@ if [ "${NEED_DOWNLOAD}" = "1" ]; then
             mv "${SUB_CACHE_PATH}.tmp" "${SUB_CACHE_PATH}"
             log_msg "  ✅ 订阅下载成功: $(stat -c%s "${SUB_CACHE_PATH}" 2>/dev/null || wc -c < "${SUB_CACHE_PATH}") bytes"
         else
-            log_msg "  ⚠️ 订阅下载失败，使用上次缓存"
+            log_msg "  ⚠️ 订阅下载失败"
+            SUB_DOWNLOAD_FAILED=1
             rm -f "${SUB_CACHE_PATH}.tmp"
         fi
     fi
+fi
+
+# ⚠️ 切换订阅失败必须整体回滚（v8 修复）：
+# 过去「新订阅下载失败 → 沿用旧缓存继续生成 → config.yaml 用旧节点、
+# settings.conf 却写入了新 URL」——界面显示新订阅、实际跑的还是旧订阅。
+# 现在只要「本次是切换订阅（URL 变更）且新订阅没拿到」，就直接放弃：
+# 不覆盖 config.yaml、不写 settings.conf、不重启内核，由管理界面报错。
+# （URL 未变的定时/手动刷新不在此列：refresh_sub 下载失败根本不会调到这里。）
+if [ "${SUB_DOWNLOAD_FAILED}" = "1" ] && [ "${SUB_TYPE}" = "remote" ] \
+        && [ -n "${PREV_SUB_URL}" ] && [ "${PREV_SUB_URL}" != "${SUB_URL}" ]; then
+    log_msg "  ❌ 新订阅下载失败 → 回滚本次切换（保留原订阅与当前配置）"
+    progress_set "failed" 100 "新订阅下载失败，已保留原订阅与当前配置"
+    log_msg "===== config_callback v8 完成（订阅切换回滚）====="
+    exit 6
 fi
 
 [ "${SUB_TYPE}" = "local" ] && [ -n "${SUB_PATH}" ] && [ -f "${SUB_PATH}" ] && cp -f "${SUB_PATH}" "${SUB_CACHE_PATH}"

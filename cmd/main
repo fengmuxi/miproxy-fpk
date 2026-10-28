@@ -344,7 +344,7 @@ sync_cmd_scripts() {
     local dest="${TRIM_PKGVAR}/cmd"
     mkdir -p "${dest}" 2>/dev/null
     local name
-    for name in main admin_server.py config_callback refresh_sub sub_download.sh miproxy_config_lib.sh; do
+    for name in main admin_server.py config_callback refresh_sub sub_download.sh miproxy_config_lib.sh sub_convert.py; do
         [ -f "${src_dir}/${name}" ] || continue
         # 每次都比对内容：只在「不存在时复制」会让升级后数据目录里的旧副本一直生效
         if ! cmp -s "${src_dir}/${name}" "${dest}/${name}" 2>/dev/null; then
@@ -356,10 +356,13 @@ sync_cmd_scripts() {
             fi
         fi
     done
-    # refresh_sub 是被复制到数据目录根目录运行的，它要用的 sub_download.sh
-    # 也得放在同一层，否则 source 不到。
+    # refresh_sub 是被复制到数据目录根目录运行的，它要用的 sub_download.sh /
+    # sub_convert.py 也得放在同一层，否则 source / 探测不到。
     if [ -f "${src_dir}/sub_download.sh" ] && [ ! -f "${TRIM_PKGVAR}/sub_download.sh" ]; then
         cp -f "${src_dir}/sub_download.sh" "${TRIM_PKGVAR}/sub_download.sh" 2>/dev/null
+    fi
+    if [ -f "${src_dir}/sub_convert.py" ] && [ ! -f "${TRIM_PKGVAR}/sub_convert.py" ]; then
+        cp -f "${src_dir}/sub_convert.py" "${TRIM_PKGVAR}/sub_convert.py" 2>/dev/null
     fi
 }
 

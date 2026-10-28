@@ -93,7 +93,7 @@ jobs:
 
       - name: 修复脚本权限
         run: |
-          for f in cmd/main cmd/refresh_sub cmd/admin_server.py cmd/install_init cmd/install_callback cmd/uninstall_init cmd/uninstall_callback cmd/upgrade_init cmd/upgrade_callback cmd/config_init cmd/config_callback cmd/sub_download.sh cmd/miproxy_config_lib.sh; do
+          for f in cmd/main cmd/refresh_sub cmd/admin_server.py cmd/install_init cmd/install_callback cmd/uninstall_init cmd/uninstall_callback cmd/upgrade_init cmd/upgrade_callback cmd/config_init cmd/config_callback cmd/sub_download.sh cmd/sub_convert.py cmd/miproxy_config_lib.sh; do
             [ -f "$f" ] && sed -i 's/\r$//' "$f" && chmod +x "$f"
           done
           echo "✅ 脚本权限已修复"
@@ -168,7 +168,7 @@ jobs:
 
       - name: 修复脚本权限
         run: |
-          for f in cmd/main cmd/refresh_sub cmd/admin_server.py cmd/install_init cmd/install_callback cmd/uninstall_init cmd/uninstall_callback cmd/upgrade_init cmd/upgrade_callback cmd/config_init cmd/config_callback cmd/sub_download.sh cmd/miproxy_config_lib.sh; do
+          for f in cmd/main cmd/refresh_sub cmd/admin_server.py cmd/install_init cmd/install_callback cmd/uninstall_init cmd/uninstall_callback cmd/upgrade_init cmd/upgrade_callback cmd/config_init cmd/config_callback cmd/sub_download.sh cmd/sub_convert.py cmd/miproxy_config_lib.sh; do
             [ -f "$f" ] && sed -i 's/\r$//' "$f" && chmod +x "$f"
           done
           echo "✅ 脚本权限已修复"

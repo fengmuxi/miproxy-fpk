@@ -699,6 +699,7 @@ def _run_config_callback(env, script, cfg_before, pid_before):
     # 返回码 3 是 config_callback 约定的「配置已写入但内核重启失败」，
     # 返回码 4 是「订阅没解析出任何节点」（节点没生效，且可能保留了旧配置）。
     # 返回码 5 是「另一个配置应用正在进行」（跨进程锁没拿到）。
+    # 返回码 6 是「新订阅下载失败，本次切换已整体回滚」（原订阅与配置原样保留）。
     if proc.returncode == 3:
         body["error"] = "配置已写入，但内核重启失败——新配置不会生效，请查看日志"
     elif proc.returncode == 4:
@@ -710,6 +711,11 @@ def _run_config_callback(env, script, cfg_before, pid_before):
         body["sub_nodes"] = 0
     elif proc.returncode == 5:
         body["error"] = "另一个配置应用正在进行，请稍后重试"
+    elif proc.returncode == 6:
+        body["error"] = "新订阅下载失败，本次切换未生效：已保留原订阅与当前配置，可稍后重试或检查订阅链接"
+        diag = _last_interesting_log_line(("订阅下载失败", "不是 Clash/mihomo 格式"))
+        if diag:
+            body["error"] += "（" + diag + "）"
     else:
         detail = (proc.stderr or proc.stdout or "").strip().splitlines()
         body["error"] = "生成配置失败（config_callback 返回 %s）%s" % (
