@@ -1206,9 +1206,17 @@ def build_status():
         except OSError:
             return {"exists": False}
 
+    # mihomo 控制端口也就是「面板选择页」所在端口（external-ui 挂在 /ui），
+    # 前端用它拼「返回面板」的地址，避免把 9090 写死在 HTML 里。
+    try:
+        panel_port = int((read_settings().get("wizard_api_port") or "9090").strip() or 9090)
+    except (TypeError, ValueError):
+        panel_port = 9090
+
     return {
         "mihomo": {"running": pid_alive(mihomo_pid), "pid": mihomo_pid},
         "admin": {"running": pid_alive(admin_pid), "pid": admin_pid, "port": PORT},
+        "panel_port": panel_port,
         "config": file_info(CONFIG_FILE),
         "subscription": file_info(SUBSCRIPTION_FILE),
         "kernel": {"version": kernel_version_of(KERNEL_BIN).get("version") or "",

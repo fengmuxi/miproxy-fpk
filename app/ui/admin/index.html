@@ -32,6 +32,10 @@
        color:#5b6072;text-decoration:none;white-space:nowrap;transition:.15s}
   .tab:hover{background:#eef0fb;color:#3f45a0}
   .tab.active{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff}
+  /* 「← 面板」回退入口：独立类名，避免被 route() 重写 menu 的 className 时抹掉 */
+  .tab-back{display:block;padding:8px 10px;margin-right:2px;border-radius:9px;font-size:13.5px;font-weight:600;
+            color:#8a8fa3;text-decoration:none;white-space:nowrap;transition:.15s}
+  .tab-back:hover{background:#eef0fb;color:#3f45a0}
   main.wrap{padding-top:18px;padding-bottom:30px}
   .view{display:none}
   .view.active{display:block}
@@ -166,6 +170,7 @@
       </div>
     </div>
     <nav class="tabs" id="navTabs">
+      <a class="tab-back" id="panelBtn" href="#" title="返回面板选择页（Zashboard / MetaCubeXD）">← 面板</a>
       <a class="tab active" href="#/overview" data-view="overview">概览</a>
       <a class="tab" href="#/subscriptions" data-view="subscriptions">订阅</a>
       <a class="tab" href="#/proxy" data-view="proxy">代理与面板</a>
@@ -430,7 +435,7 @@
 
   var TOKEN_KEY = "miproxy_admin_token";
   var state = { authRequired: false, timer: null, subs: { items: [], active_id: "" }, editingId: null, subBusy: false,
-                kernel: null, kPoll: null, kBusy: false };
+                kernel: null, kPoll: null, kBusy: false, panelPort: 9090 };
 
   function $(id) { return document.getElementById(id); }
   function token() { try { return localStorage.getItem(TOKEN_KEY) || ""; } catch (e) { return ""; } }
@@ -503,6 +508,10 @@
     state.authRequired = !!s.auth_required;
     if (s.auth_required && !token()) showAuthBanner(false);
     else if (s.write_locked) showAuthBanner(true);
+
+    if (s.panel_port) state.panelPort = s.panel_port;
+    // 「返回面板」用真实 href，不依赖 JS 点击（面板页由 mihomo external-ui 挂在 <控制端口>/ui/）
+    $("panelBtn").href = location.protocol + "//" + location.hostname + ":" + (state.panelPort || 9090) + "/ui/";
 
     var running = s.mihomo && s.mihomo.running;
     $("dot").className = "dot " + (running ? "on" : "off");
@@ -1060,6 +1069,12 @@
   }
 
   // ---------------------------------------------------------------- 顶部菜单路由
+  // ⚠️ 不要把「当前是哪个页面」只交给 location.hash：
+  // fnOS 桌面窗口里页面可能是 sandbox / opaque-origin 文档（about:srcdoc 之类），
+  // 这种环境下 location.hash 赋值会抛异常、history.replaceState 也不可用，
+  // 于是 hash 永远不变 → hashchange 永不触发 → 菜单点下去毫无反应（线上就是这个现象）。
+  // 所以这里以内存态 _view 为唯一真相，hash 只做「尽力同步」：
+  // 正常浏览器里地址栏/分享/前进后退照旧，受限环境里照样能切页。
   var VIEW_LOADERS = {
     overview: function () { loadStatus(true); loadSubs(); loadSettings(); loadOverview(); },
     subscriptions: function () { loadSubs(); loadSettings(); },
@@ -1067,14 +1082,19 @@
     kernel: function () { loadKernel(); },
     logs: function () { loadLogs(); }
   };
+  var _view = "overview";     // 当前视图（内存态）
+  var _pendingHash = "";      // 自己刚写入的 hash，用来吃掉随之而来的 hashchange，避免重复渲染
 
-  function currentView() {
+  function viewFromHash() {
     var name = (location.hash || "").replace(/^#\/?/, "").replace(/\/$/, "");
-    return VIEW_LOADERS[name] ? name : "overview";
+    return VIEW_LOADERS[name] ? name : "";
   }
 
-  function route() {
-    var name = currentView();
+  // 切换到指定视图；syncHash=true 时顺便把地址栏同步过去（失败不影响切换）
+  function showView(name, syncHash) {
+    if (!VIEW_LOADERS[name]) name = "overview";
+    _view = name;
+
     var tabs = document.querySelectorAll("#navTabs .tab");
     for (var i = 0; i < tabs.length; i++) {
       tabs[i].className = "tab" + (tabs[i].getAttribute("data-view") === name ? " active" : "");
@@ -1083,13 +1103,33 @@
     for (var j = 0; j < views.length; j++) {
       views[j].className = "view" + (views[j].id === "view-" + name ? " active" : "");
     }
+    // 切页后回到顶部，否则上一页滚到一半的位置会带到新页面
+    try { window.scrollTo(0, 0); } catch (e) { /* 忽略 */ }
+
+    if (syncHash) {
+      var target = "#/" + name;
+      if (location.hash !== target) {
+        _pendingHash = target;
+        try { location.hash = target; } catch (e) { /* opaque origin 下不可写，忽略 */ }
+      }
+    }
+
     // 日志自动刷新只在「日志」页运行，切走即停，避免后台空转
     if (name !== "logs") stopAutoLog();
     else if ($("log_auto").checked) startAutoLog();
 
-    if (VIEW_LOADERS[name]) VIEW_LOADERS[name]();
+    // 单个视图的数据加载失败不应影响切页本身
+    try {
+      VIEW_LOADERS[name]();
+    } catch (e) {
+      if (window.console && console.error) console.error("加载视图失败:", name, e);
+    }
     return name;
   }
+
+  // 兼容旧调用点（如「连接」按钮后重刷当前页）：以内存态为准，
+  // 不要回读 hash —— hash 写入在受限环境里可能被吞掉，回读会把页面弹回旧视图。
+  function route() { return showView(_view, false); }
 
   function boot() {
     $("reloadBtn").onclick = function () { loadStatus(); loadSubs(); loadOverview(); };
@@ -1153,14 +1193,37 @@
       route();
     };
 
-    // 顶部菜单：原生 hash 路由，刷新/收藏/前进后退都能保持页面
-    window.addEventListener("hashchange", route);
+    // 顶部菜单：显式接管点击，不依赖 <a href="#/x"> 的默认导航
+    // 挂在 document 的捕获阶段：万一外层壳程序（fnOS 桌面）在冒泡阶段拦链接，
+    // 这里也已经先一步把视图切了。
+    document.addEventListener("click", function (ev) {
+      var el = ev.target;
+      while (el && el !== document.body && !(el.getAttribute && el.getAttribute("data-view"))) {
+        el = el.parentNode;
+      }
+      if (!el || !el.getAttribute) return;
+      var name = el.getAttribute("data-view");
+      if (!name || !VIEW_LOADERS[name]) return;
+      if (ev.preventDefault) ev.preventDefault();
+      showView(name, true);
+    }, true);
+
+    // 地址栏 hash 变化（手改 URL / 前进后退）仍然认，正常浏览器下保持可分享
+    window.addEventListener("hashchange", function () {
+      var h = location.hash || "";
+      if (h && h === _pendingHash) { _pendingHash = ""; return; }   // 自己刚写的，已渲染过
+      _pendingHash = "";
+      var name = viewFromHash();
+      if (name && name !== _view) showView(name, false);
+    });
+
+    var initial = viewFromHash() || "overview";
     if (!location.hash) {
-      try { history.replaceState(null, "", "#/overview"); } catch (e) { /* file:// 下可能不支持 */ }
+      try { history.replaceState(null, "", "#/" + initial); } catch (e) { /* file:// / opaque origin 下可能不支持 */ }
     }
 
-    loadStatus(true);   // 顶部状态常驻，先拿一次
-    route();
+    loadStatus(true);          // 顶部状态常驻，先拿一次
+    showView(initial, false);  // 按初始视图渲染（hash 可读则用它，否则用概览）
 
     // 状态点轻量轮询（页面不可见时跳过）
     setInterval(function () {

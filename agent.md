@@ -201,6 +201,8 @@ miproxy-fpk/
 20. **本仓库是 fork，推 tag 不会触发构建**：`fengmuxi/miproxy-fpk` fork 自 `56025192/miproxy-fpk`。GitHub 默认不在 fork 上跑工作流，现象是 tag 推上去了、`git ls-remote --tags` 看得见，但 `GET /actions/runs` 的 `total_count` 恒为 0（父仓库同期有 169 次 push 触发的 Build FPK，可作对照），而 `workflow_dispatch` 仍然能跑。发布要么先去 Actions 页点 "I understand my workflows, go ahead and enable them"，要么用 `POST /actions/workflows/build-release.yml/dispatches` 手动触发（`inputs` 必须是对象，空也要给 `{}`）。
 21. **用 API 触发时若 tag 已指向 HEAD，Release 正文是空的**：`changes` 作业用 `git describe --tags --abbrev=0` 取上一个 tag，正好取到刚推的这个 tag，`git diff` 为空 → 「变更详情」只剩两行表头。要么先触发后打 tag，要么事后 `PATCH /releases/{id}` 把正文补上。
 22. **本机 `~/.gitconfig` 里有一行空的 `credential.helper=`**，它会把系统级的 `manager` 清空，导致所有 `git push` 报 `could not read Username for 'https://github.com': terminal prompts disabled`（明明 Windows 凭据管理器里就有 `git:https://github.com`）。不要改用户的全局配置，用命令级覆盖：`git -c credential.helper=manager push ...`；需要 token 调 API 时同理 `git -c credential.helper=manager credential fill`。
+23. **顶部菜单切页不要依赖 hash**：fnOS 桌面窗口是壳程序里的 webview，`<a href="#/x">` 这次同文档导航可能被壳拦掉（`will-navigate` / `did-start-navigation` 里 `preventDefault`），于是 hash 不变 → `hashchange` 不触发 → 菜单点了毫无反应，而页面其它 JS 一切正常（概览数据照常渲染，很能骗人）。现在的做法：`_view` 内存态是唯一真相，`showView(name, syncHash)` 先切 DOM 再尽力同步 hash，点击监听挂 `document` 捕获阶段；**`route()` 只重渲染 `_view`，绝不能回读 hash**，否则受限环境里点「连接」会被旧 hash 弹回概览。
+24. **`/api/status` 的 `panel_port`** 来自 `settings.conf` 的 `wizard_api_port`（mihomo 控制端口，面板页 `external-ui` 挂在它的 `/ui/`）。新加需要跨端口跳转的入口时复用它，别再往 HTML 里写死 9090/9091。
 
 ---
 
