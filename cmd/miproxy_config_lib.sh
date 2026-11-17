@@ -247,11 +247,18 @@ extract_subscription_fields() {
 # emit_config_yaml
 # 依赖（调用前须已设置）：HTTP_PORT API_PORT SECRET PROXY_USER PROXY_PASS
 #   TUN_ENABLE UI_TARGET；以及 SUB_DOMAIN_FILTER/domain 与 SUB_PROXIES 等抽取字段。
+# 可选：CTRL_PORT —— mihomo external-controller 的内部监听端口（默认 9092）。
+#   v2.8.8 起 9090 由 gateway.py 统一入口网关占用（fn 链接只映射 service_port），
+#   mihomo 收敛为只监听 127.0.0.1:<内部端口>，由网关按路径转发；这样管理界面
+#   与三块面板共用同一条被映射的通道，远程访问不再依赖第二个端口。
 # 输出：把完整 config.yaml 写入 ${CONFIG_TMP}（调用方负责校验节点数后落盘）。
 # 这是 install_callback 与 config_callback 唯一的 config.yaml 生成入口，
 # 两者因此必然一致（功能等价、flow/block 风格也统一为 inline 数组写法）。
 # ----------------------------------------------------------------------------
 emit_config_yaml() {
+    # 内部端口公式必须与 cmd/main 的 mihomo_ctrl_port() 保持一致（API_PORT+1000，超界则 -1000）
+    local ctrl_port="${CTRL_PORT:-$(( API_PORT + 1000 ))}"
+    [ "${ctrl_port}" -le 65535 ] || ctrl_port=$(( API_PORT - 1000 ))
     {
         echo "# MiProxy 主配置（由 cmd/miproxy_config_lib.sh 统一生成）"
         echo ""
@@ -260,7 +267,7 @@ emit_config_yaml() {
         echo "mode: rule"
         echo "log-level: info"
         echo "ipv6: false"
-        echo "external-controller: 0.0.0.0:${API_PORT}"
+        echo "external-controller: 127.0.0.1:${ctrl_port}"
         echo "external-ui: ${UI_TARGET}"
         echo "external-ui-name: zashboard"
         [ -n "${SECRET}" ] && echo "secret: \"${SECRET}\""

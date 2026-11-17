@@ -31,7 +31,8 @@ miproxy-fpk/
 ├── cmd/                     # ★ 主要“源码”：fnOS 生命周期 bash 脚本
 │   ├── main                 # 启停管理：start|stop|restart|status（含刷新守护进程 + 管理服务）
 │   ├── refresh_sub          # 订阅刷新守护进程（循环下载订阅 + 重启 mihomo）；`once` 为单次“刷新并应用”
-│   ├── admin_server.py      # 管理界面后端（Python3 标准库，端口 9091，见 §7）
+│   ├── gateway.py           # 9090 统一入口网关（v2.8.8）：按路径分发到管理服务 9091 与 mihomo 内部控制器，TCP 透传支持 WebSocket
+│   ├── admin_server.py      # 管理界面后端（Python3 标准库，内部端口 9091，对外统一走 9090 网关，见 §7）
 │   ├── sub_download.sh      # 订阅下载统一入口（带 clash.meta UA + 换 UA 重试，见 §9.33）
 │   ├── install_callback     # 安装后回调：拷二进制/前端/数据、下订阅、生成 config.yaml、写 settings.conf、启动
 │   ├── install_init         # 安装前回调（当前仅 exit 0）
@@ -111,9 +112,9 @@ miproxy-fpk/
 | 安装后 | `install_callback` | 拷资源 → 下订阅 → 生成 config.yaml → 写 settings.conf → 调 `main start` |
 | 配置前 | `config_init` | 当前空 |
 | 配置后 | `config_callback` | 重新生成配置 + 用 `restart-kernel` **只重启内核**（**未读，改配置相关逻辑时必须先读它**）；重启期间写 `apply.progress` 阶段进度，并用 `RESTART_FLAG` 让 `main status` 仍返回运行，避免 fnOS 误判应用停止 |
-| 启动/停止/重启/状态 | `main` | 管理 mihomo 进程 + 刷新守护进程 + 管理服务（`admin_server.py`）；`status` 返回 fnOS 约定的退出码（运行=0，停止=3）。**即使 mihomo 启动失败也会拉起管理服务**，便于在界面里改错配置 |
+| 启动/停止/重启/状态 | `main` | 管理 mihomo 进程 + 刷新守护进程 + 管理服务（`admin_server.py`）+ **统一入口网关（`gateway.py`，v2.8.8）**；`status` 返回 fnOS 约定的退出码（运行=0，停止=3）。**即使 mihomo 启动失败也会拉起管理服务与网关**，便于在界面里改错配置 |
 | 订阅刷新 | `refresh_sub` | 常驻守护进程，按 `wizard_refresh_interval` 小时循环；自带 `LOCK_FILE` 防并发；结束时 `trap` 清理锁与 PID 文件。**每轮都走「下载缓存 → `apply_config no-restart` 重生成 config.yaml → `restart_mihomo`」**，成功记「已应用新订阅」。带 `once` 参数时为单次「刷新并应用」（下载 → `config_callback` 重生成 → 重启内核），供管理界面「立即刷新订阅」调用 |
-| 管理服务 | `admin_server.py` | 由 `main` 拉起（`nohup`），提供 9091 的静态页 + REST API；不受 mihomo 启停影响 |
+| 统一入口网关 | `gateway.py` | 由 `main` 拉起（`nohup`），**独占 9090**（fn 链接只映射这个端口）：按连接首个 HTTP 请求路径分发——`/api/*`、`/admin*` → 9091 管理服务，其余（`/ui/*`、`/configs`、`/traffic` 等）→ mihomo 内部控制器（`127.0.0.1:面板端口+1000`）。TCP 透传，WebSocket/流式响应天然可用；对非 WS 请求注入 `Connection: close` 防 keep-alive 跨后端错路由（见 §9.40） |
 | 升级 | `upgrade_init` / `upgrade_callback` | 升级兼容（日志写入 `upgrade_init.log` / `upgrade_callback.log`） |
 | 卸载 | `uninstall_init` / `uninstall_callback` | 清理（含停止管理服务、删 `admin.pid`） |
 
@@ -128,7 +129,7 @@ miproxy-fpk/
 
 ---
 
-## 7. 管理界面（端口 9091）
+## 7. 管理界面（内部端口 9091，对外统一走 9090 网关）
 
 前端 `app/ui/admin/index.html`（单文件，原生 JS，无构建），后端 `cmd/admin_server.py`（Python3 标准库，**不引入任何第三方依赖**，因为 fnOS 上只保证有 python3）。
 
@@ -236,6 +237,10 @@ miproxy-fpk/
 37. **切换订阅不再「全家桶重启」**：`config_callback` 过去用 `main stop` + `main start` 应用新配置，会顺手停掉刷新守护进程和管理服务，且内核重启到完成之间有十几秒窗口，fnOS 靠 `main status`（0=运行 / 3=停止）巡检，抓到这一瞬就把应用标成「已停止」——这正是「切换订阅后应用直接停止、需要手动启动」的成因。现在改为 **`main restart-kernel`**：①**只重启内核进程**，管理服务与订阅刷新守护进程原地不动；②重启窗口内 `main` 写 `RESTART_FLAG`（数据目录 `restarting`，内容为持标进程 PID），`status` 在标记有效期内（持标进程存活且未超 5 分钟）仍返回 0，fnOS 不会误判；③内核启动统一 `nohup`，避免被 `config_callback` / `restart-kernel` 这些瞬态调用进程退出时的 SIGHUP 带走。只有在需要整族重启（改到 TUN 之外的运行参数）时才用 `main restart`。`restart-kernel` 与 `restart` 都加 `mark_restarting`/`clear_restarting` 成对包裹。
 38. **切换 / 保存配置要有进度反馈 + 屏蔽并发**：`config_callback` 全程写 `apply.progress`（`stage` / `percent` / `message`，UTF-8），阶段为 `downloading` → `parsing` → `generating` → `restarting` → `done` / `failed`；管理服务把「应用配置」改成**后台线程异步执行**，POST `/api/settings`、`/api/subscriptions` 返回 **202**（而非同步 200），前端轮询 `/api/apply/progress`，并在应用期间弹**遮罩**阻止用户再点切换 / 保存。「切换订阅」与「定时刷新」通过 `apply.lock`（目录锁 + `pid` 文件，跨进程串行化）互斥，冲突时 `config_callback` 返回 **5**，前端提示「另一个操作正在进行」。新增「触发配置应用」的路径时，务必：①带 `MIPROXY_KEEP_ADMIN=1`（不杀管理服务）；②不要自己 `main stop`（用 `restart-kernel`）；③写 `apply.progress` 让前端有反馈；④尊重 `apply.lock`（守护进程自己持锁调用时传 `MIPROXY_APPLY_LOCKED=1`，避免自锁死）。
 39. **重装 / 升级不再抹掉面板已配的订阅**：fnOS 升级时再次执行 `install_callback`，而它原本无条件整体重写 `settings.conf`，于是「首次装选了『暂不配置』→ 之后在面板配好远程订阅 → 更新安装又被打回 none」。现在 `install_callback` 检测到既有 `settings.conf` 时，向导给的是默认值（none / 空）就**沿用旧配置**（订阅类型 / 链接 / 密钥 / HTTP/API 端口 / 刷新间隔 / 管理端口令牌全保留），只有向导显式给了新值才覆盖；首次安装行为不变。判定「显式指定」的规则：远程订阅需 `wizard_sub_type=remote` 且 `wizard_sub_url` 非空、本地订阅需路径真实存在。在管理界面改过订阅后重装不会丢，除非你确实想在向导里重新指定。
+
+40. **9090 是统一入口网关（v2.8.8），mihomo 退到内部端口**：fn 链接等远程方案只映射 manifest 的 `service_port`（9090），管理服务（9091）第二个端口永远到不了远程——过去 admin 卡片硬编码跳 `hostname:9091`，远程必挂。现在 `gateway.py` 独占 9090，按连接首个 HTTP 请求路径分发（`/api/*`、`/admin*` → 9091；其余 → mihomo `127.0.0.1:面板端口+1000`），之后 TCP 透传。三个必须知道的坑：①**keep-alive 错路由**——浏览器会复用同一条连接先后请求不同路径，而路由按「连接第一个请求」决定，所以网关对非 WS 请求强制注入 `Connection: close`，新增后端路径时别破坏这个机制；②**WebSocket 不能动**——`/traffic`、`/connections` 是 WS，透传实现里对带 `Upgrade` 头的请求保持原样；③**升级路径**——install_callback 会先 `restart-kernel` 让新 config（internal controller）生效、释放 9090，再 `main start` 拉起网关；缺这个顺序网关绑定 9090 必失败。内部端口公式在 `mihomo_ctrl_port()`（main）与 `emit_config_yaml`（lib）两处各有一份，改必须同步。`python3` 缺失的影响面因此扩大到面板本身（网关起不来 9090 就没人监听）。
+
+41. **日志安全阀（v2.8.9）——「运行久了崩溃」的头号元凶是日志写满磁盘**：info.log 是 mihomo 内核输出（info 级别、TUN 下每连接一条）+ 所有脚本 log_msg 的去处，admin.log 每请求一行。双层轮转：`main` 的 `rotate_logs()`（start/restart/restart-kernel 入口）+ admin_server 的 `_log_rotate_worker`（每小时兜底，应用不重启也有界）。策略：超 10MB（`LOG_ROTATE_MAX`）保留 `.1` 后 **truncate 清空**——必须用 truncate 不能 mv：长驻进程的日志 fd 是 O_APPEND，mv 后旧 fd 仍写向轮转文件、新文件没人写。改日志清单/阈值时同步两处（main 的 bash 清单与 admin_server 的 LOG_ROTATE_FILES）。磁盘水位 <500MB 由 admin_server 打节流警告（6h 一次）。排查「运行久了崩溃」先看磁盘剩余空间。
 
 ---
 

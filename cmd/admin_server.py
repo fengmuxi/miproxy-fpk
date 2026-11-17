@@ -791,6 +791,30 @@ def _api_port():
         return 9090
 
 
+def _mihomo_ctrl_port():
+    """mihomo external-controller 实际监听的端口（本机直连用，不走网关）。
+
+    v2.8.8 起 9090 由 gateway.py 统一入口网关占用（fn 链接只映射 service_port），
+    mihomo 收敛为 127.0.0.1:<内部端口>（默认 9092）。config.yaml 是内核实际生效
+    的权威来源，优先解析它；解析失败（老配置 / 文件缺失）退回设置项——
+    老配置的 external-controller 是 0.0.0.0:9090，端口语义仍然正确。
+    """
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("external-controller:"):
+                    value = line[len("external-controller:"):].strip()
+                    if ":" in value:
+                        port_part = value.rpartition(":")[2].strip()
+                        port = int(port_part)
+                        if 1 <= port <= 65535:
+                            return port
+                    break
+    except (OSError, ValueError):
+        pass
+    return _api_port()
+
+
 def _mihomo_secret():
     """调用内核控制端口用的密钥：以 config.yaml 里的 secret 为准。
 
@@ -818,7 +842,7 @@ def _mihomo_api(path, timeout=4.0):
     注意：显式禁用环境变量里的 http_proxy —— 这是本机回环地址，
     走代理只会绕一圈然后失败。
     """
-    url = "http://127.0.0.1:%d%s" % (_api_port(), path)
+    url = "http://127.0.0.1:%d%s" % (_mihomo_ctrl_port(), path)
     req = urllib.request.Request(url)
     secret = _mihomo_secret()
     if secret:
@@ -2036,6 +2060,94 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "not found"})
 
 
+# ---------------------------------------------------------------- 日志安全阀
+#
+# 为什么需要：info.log 承载 mihomo 内核输出（log-level: info，TUN 全局代理下每个
+# 连接一条日志）、admin.log 每个请求一行——整个项目过去没有任何轮转机制，日志
+# 无限增长写满磁盘后，内核 cache.db 写入失败崩溃、各服务写日志失败，表现就是
+# 「应用运行久了莫名其妙崩溃」。
+#
+# 为什么用 truncate 而不是 mv 轮转：mihomo / admin_server / gateway 是长驻进程，
+# 日志 fd 以追加模式（O_APPEND）打开——truncate 清空后继续写会落在文件新末尾
+# （0 处），无需重启任何进程；而 mv 之后旧 fd 仍写向轮转后的文件，新文件没人写。
+#
+# 双层设计：main 在 start/restart/restart-kernel 时也会轮转一次（bash 侧同名逻辑）；
+# 本线程是常驻兜底——应用几个月不重启时，日志依然有界。磁盘水位低于阈值时
+# 在 info.log 里留一条节流警告，给用户留出清理时间。
+
+LOG_ROTATE_MAX = 10 * 1024 * 1024          # 单文件 10MB 触发轮转
+LOG_ROTATE_INTERVAL = 3600                 # 兜底轮转检查周期（秒）
+LOG_ROTATE_FILES = (
+    "info.log", "admin.log", "gateway.log", "refresh_sub.log",
+    "config_callback.log", "install_callback.log",
+    "upgrade_init.log", "upgrade_callback.log",
+)
+DISK_FREE_MIN = 500 * 1024 * 1024          # 数据卷剩余空间低于 500MB 告警
+_disk_warn_last = [0.0]
+
+
+def _append_info_log(line):
+    try:
+        with open(os.path.join(VAR_DIR, "info.log"), "a", encoding="utf-8") as fh:
+            fh.write(time.strftime("%Y-%m-%d %H:%M:%S - ") + line + "\n")
+    except OSError:
+        pass
+
+
+def _rotate_logs_once():
+    """超过上限的日志：保留一份 .1 后清空原文件。返回轮转明细（或空）。"""
+    rotated = []
+    for name in LOG_ROTATE_FILES:
+        path = os.path.join(VAR_DIR, name)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        if size <= LOG_ROTATE_MAX:
+            continue
+        try:
+            with open(path, "rb") as src:
+                with open(path + ".1", "wb") as dst:
+                    shutil.copyfileobj(src, dst, 1024 * 1024)
+            with open(path, "w"):
+                pass  # truncate 到 0（追加 fd 的后续写入从新末尾开始）
+            rotated.append("%s(%dKB)" % (name, size // 1024))
+        except OSError:
+            continue
+    return rotated
+
+
+def _check_disk_watermark():
+    """数据卷剩余空间不足时打节流警告（至少间隔 6 小时，避免自己把警告写爆磁盘）。"""
+    try:
+        free = shutil.disk_usage(VAR_DIR).free
+    except OSError:
+        return
+    if free >= DISK_FREE_MIN:
+        return
+    now = time.time()
+    if now - _disk_warn_last[0] < 6 * 3600:
+        return
+    _disk_warn_last[0] = now
+    _append_info_log(
+        "⚠️ 磁盘水位预警: %s 所在卷剩余仅 %.0fMB，低于 500MB。"
+        "日志已由安全阀自动轮转；请检查其它大文件，磁盘写满会导致内核与各服务异常退出。"
+        % (VAR_DIR, free / (1024 * 1024))
+    )
+
+
+def _log_rotate_worker():
+    while True:
+        time.sleep(LOG_ROTATE_INTERVAL)
+        try:
+            rotated = _rotate_logs_once()
+            if rotated:
+                _append_info_log("日志轮转（定时兜底）: " + ", ".join(rotated))
+            _check_disk_watermark()
+        except Exception:  # noqa: BLE001 - 安全阀自身绝不能把服务搞挂
+            pass
+
+
 # ---------------------------------------------------------------- 入口
 
 def main():
@@ -2045,6 +2157,16 @@ def main():
     os.makedirs(VAR_DIR, exist_ok=True)
     with open(PID_FILE, "w", encoding="utf-8") as fh:
         fh.write(str(os.getpid()))
+
+    # 启动即轮转一次 + 常驻兜底线程：日志大小永远有界
+    try:
+        rotated = _rotate_logs_once()
+        if rotated:
+            _append_info_log("日志轮转（启动时）: " + ", ".join(rotated))
+        _check_disk_watermark()
+    except Exception:  # noqa: BLE001
+        pass
+    threading.Thread(target=_log_rotate_worker, name="log-rotate", daemon=True).start()
 
     def _shutdown(_signum, _frame):
         try:

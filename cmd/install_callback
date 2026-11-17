@@ -320,6 +320,13 @@ fi
 chmod 666 "${TRIM_PKGETC}/settings.conf" 2>/dev/null
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 新 config 的 external-controller 已收敛到内部端口（v2.8.8 起，9090 让给统一网关）。
+# 升级场景下旧内核还活着并占着 9090（老配置 0.0.0.0:9090），必须先 restart-kernel
+# 让新配置生效、释放 9090，否则网关绑定 9090 会失败，面板与管理界面全部不可达。
+if bash "${SCRIPT_DIR}/main" status >/dev/null 2>&1; then
+    log_msg "检测到内核在运行，重启内核以应用新配置（释放 9090 给统一入口网关）..."
+    bash "${SCRIPT_DIR}/main" restart-kernel 2>>"${DEBUG_LOG}" || true
+fi
 bash "${SCRIPT_DIR}/main" start 2>>"${DEBUG_LOG}" && log_msg "✅ miproxy 启动成功" || log_msg "⚠️  miproxy 启动失败"
 # 让刷新守护进程与最终生效的设置对齐
 # （重装时订阅类型/刷新间隔可能沿用了旧配置，main start 只看 settings.conf 决定要不要起守护进程）
