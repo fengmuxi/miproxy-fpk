@@ -7,6 +7,7 @@ LOG_FILE="${TRIM_PKGVAR}/info.log"
 PID_FILE="${TRIM_PKGVAR}/app.pid"
 REFRESH_PID_FILE="${TRIM_PKGVAR}/refresh_sub.pid"
 ADMIN_PID_FILE="${TRIM_PKGVAR}/admin.pid"
+GATEWAY_PID_FILE="${TRIM_PKGVAR}/gateway.pid"
 # 「内核正在重启」标记文件。
 # 为什么需要它：fnOS 靠 `main status` 的退出码判断应用生死（0=运行 / 3=停止），
 # 换配置必然要重启内核，中间会有几秒内核不在。fnOS 巡检到这一瞬就会把应用
@@ -24,6 +25,47 @@ CMD="${MIHOMO_BIN} -d ${MIHOMO_DIR} -f ${MIHOMO_CONFIG}"
 
 log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> ${LOG_FILE}
+}
+
+# mihomo external-controller 的内部监听端口（只绑定 127.0.0.1）。
+# v2.8.8 起 9090 由 gateway.py 统一入口占用（fn 链接只映射 service_port），
+# mihomo 退到内部端口，公式必须与 miproxy_config_lib.sh 的 emit_config_yaml 一致。
+mihomo_ctrl_port() {
+    local api_port ctrl_port
+    api_port=$(grep '^wizard_api_port=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')
+    api_port="${api_port:-9090}"
+    ctrl_port=$((api_port + 1000))
+    if [ "${ctrl_port}" -gt 65535 ]; then
+        ctrl_port=$((api_port - 1000))
+    fi
+    echo "${ctrl_port}"
+}
+
+# ============ 日志安全阀（防止「运行久了磁盘写满 → 应用崩溃」）============
+#
+# 为什么需要：info.log 承载 mihomo 内核输出（log-level: info，TUN 全局代理下
+# 每个连接都会写一条日志），几天就能涨到几个 GB；admin.log 每个请求追加一行，
+# 管理页还有轮询。日志写满磁盘后内核 cache.db 写入失败崩溃、各服务写日志失败，
+# 表现就是「应用运行久了莫名其妙崩溃」。整个项目过去没有任何轮转机制。
+#
+# 为什么用 truncate 而不是 mv 轮转：mihomo / admin_server / gateway 是长驻进程，
+# 日志 fd 以追加模式（O_APPEND）打开 —— truncate 清空后它们继续写会落在文件
+# 新末尾（0 处），无需重启任何进程；而 mv 之后旧 fd 仍写向轮转后的文件，
+# 新文件反而没人写，等于白轮转。
+LOG_ROTATE_MAX=10485760  # 10MB
+
+rotate_logs() {
+    local f p size
+    for f in info.log admin.log gateway.log refresh_sub.log config_callback.log install_callback.log upgrade_init.log upgrade_callback.log; do
+        p="${TRIM_PKGVAR}/${f}"
+        [ -f "${p}" ] || continue
+        size=$(stat -c%s "${p}" 2>/dev/null || wc -c < "${p}" 2>/dev/null | tr -d '[:space:]')
+        size="${size:-0}"
+        [ "${size}" -gt ${LOG_ROTATE_MAX} ] || continue
+        cp -f "${p}" "${p}.1" 2>/dev/null || true
+        : > "${p}"
+        log_msg "日志轮转: ${f}（${size} 字节 → 0，已保留一份 ${f}.1）"
+    done
 }
 
 # ============ 辅助函数 ============
@@ -344,7 +386,7 @@ sync_cmd_scripts() {
     local dest="${TRIM_PKGVAR}/cmd"
     mkdir -p "${dest}" 2>/dev/null
     local name
-    for name in main admin_server.py config_callback refresh_sub sub_download.sh miproxy_config_lib.sh sub_convert.py; do
+    for name in main admin_server.py config_callback refresh_sub sub_download.sh miproxy_config_lib.sh sub_convert.py gateway.py; do
         [ -f "${src_dir}/${name}" ] || continue
         # 每次都比对内容：只在「不存在时复制」会让升级后数据目录里的旧副本一直生效
         if ! cmp -s "${src_dir}/${name}" "${dest}/${name}" 2>/dev/null; then
@@ -463,6 +505,100 @@ stop_admin() {
     fi
 }
 
+# ============ 统一入口网关（9090，fn 链接唯一的对外端口）============
+#
+# 为什么需要：fn 链接只把 manifest 的 service_port（9090）映射出去，而
+# 管理界面(/api /admin)在 9091、mihomo 控制器/面板静态页在内部端口——
+# 面板选择页里「MiProxy 管理」卡片过去硬编码跳 hostname:9091，远程访问
+# 直接 ERR_CONNECTION_REFUSED。现在由 gateway.py 占住 9090 按路径分发，
+# 管理界面与三块面板共用同一条被映射的通道。
+# 实现：TCP 层按「连接的首个 HTTP 请求路径」选后端后双向透传，
+# WebSocket(/traffic /connections) 与流式响应天然可用（详见 gateway.py 顶部）。
+
+gateway_port() {
+    local port
+    port=$(grep '^wizard_api_port=' "${TRIM_PKGETC}/settings.conf" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')
+    port="${port:-9090}"
+    echo "${port}"
+}
+
+find_gateway_script() {
+    for p in "${TRIM_PKGVAR}/cmd/gateway.py" "${TRIM_APPDEST}/cmd/gateway.py" \
+             "/var/apps/miproxy/cmd/gateway.py" "/var/packages/miproxy/cmd/gateway.py" \
+             "${MAIN_DIR}/gateway.py"; do
+        [ -f "${p}" ] && { echo "${p}"; return 0; }
+    done
+    return 1
+}
+
+start_gateway() {
+    local port
+    port=$(gateway_port)
+
+    # 端口已在监听视为网关已在运行（升级/重复启动场景）
+    if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
+        log_msg "网关端口 ${port} 已在监听（视为网关已在运行），跳过启动"
+        return 0
+    fi
+
+    if [ -f "${GATEWAY_PID_FILE}" ]; then
+        local existing_pid
+        existing_pid=$(head -n 1 "${GATEWAY_PID_FILE}" 2>/dev/null | tr -d '[:space:]')
+        if [ -n "${existing_pid}" ] && check_process "${existing_pid}"; then
+            log_msg "网关进程已在运行 (PID: ${existing_pid})，等待端口就绪"
+            return 0
+        fi
+        rm -f "${GATEWAY_PID_FILE}"
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        log_msg "警告: 未找到 python3，统一入口网关无法启动 —— 9090 将无人监听，"
+        log_msg "       面板与管理界面都会不可访问。请在 fnOS 安装 python3 后重启应用。"
+        return 1
+    fi
+
+    local script
+    script=$(find_gateway_script) || {
+        log_msg "警告: 未找到 gateway.py，跳过网关启动（9090 无人监听）"
+        return 1
+    }
+
+    local ctrl_port
+    ctrl_port=$(mihomo_ctrl_port)
+    log_msg "启动统一入口网关 (端口: ${port} → admin:${ADMIN_PORT:-9091} / mihomo:${ctrl_port})..."
+    nohup env TRIM_PKGVAR="${TRIM_PKGVAR}" TRIM_PKGETC="${TRIM_PKGETC}" TRIM_APPDEST="${TRIM_APPDEST}" \
+        GATEWAY_PORT="${port}" ADMIN_PORT="${ADMIN_PORT:-9091}" MIHOMO_CTRL_PORT="${ctrl_port}" \
+        GATEWAY_LOG="${TRIM_PKGVAR}/gateway.log" \
+        python3 "${script}" >> "${TRIM_PKGVAR}/gateway.log" 2>&1 &
+    local pid=$!
+    echo "${pid}" > "${GATEWAY_PID_FILE}"
+
+    sleep 1
+    if check_process "${pid}" && (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
+        log_msg "统一入口网关已启动 (PID: ${pid})"
+        return 0
+    fi
+    log_msg "警告: 网关启动失败（端口 ${port} 可能被占用），请查看 ${TRIM_PKGVAR}/gateway.log"
+    rm -f "${GATEWAY_PID_FILE}"
+    return 1
+}
+
+stop_gateway() {
+    if [ -f "${GATEWAY_PID_FILE}" ]; then
+        local pid
+        pid=$(head -n 1 "${GATEWAY_PID_FILE}" 2>/dev/null | tr -d '[:space:]')
+        if [ -n "${pid}" ] && check_process "${pid}"; then
+            log_msg "停止统一入口网关 (PID: ${pid})..."
+            kill -TERM "${pid}" >> "${LOG_FILE}" 2>&1 || true
+            sleep 1
+            if check_process "${pid}"; then
+                kill -KILL "${pid}" 2>/dev/null || true
+            fi
+        fi
+        rm -f "${GATEWAY_PID_FILE}"
+    fi
+}
+
 # ============ miproxy 主进程管理 ============
 
 start_process() {
@@ -508,9 +644,10 @@ start_process() {
 stop_process() {
     log_msg "停止 miproxy..."
 
-    # 先停止订阅刷新守护进程与管理服务
+    # 先停止订阅刷新守护进程与管理服务、统一入口网关
     stop_refresh_daemon
     stop_admin
+    stop_gateway
 
     local pid=""
     if [ -r "${PID_FILE}" ]; then
@@ -545,10 +682,12 @@ stop_process() {
 
 case "$1" in
 start)
+    rotate_logs
     start_process
     rc=$?
-    # 无论内核是否成功都启动管理服务，便于在界面里排查/修正配置
+    # 无论内核是否成功都启动管理服务与统一入口网关，便于在界面里排查/修正配置
     start_admin
+    start_gateway
     if [ ${rc} -eq 0 ]; then
         exit 0
     else
@@ -562,14 +701,16 @@ stop)
     exit $?
     ;;
 restart)
-    # 全量重启（内核 + 守护进程 + 管理服务）。重启期间打标记，
+    # 全量重启（内核 + 守护进程 + 管理服务 + 网关）。重启期间打标记，
     # 免得 fnOS 在 status 上抓到「停止」这一瞬把应用标成已停止。
     mark_restarting
+    rotate_logs
     stop_process
     sleep 2
     start_process
     rc=$?
     start_admin
+    start_gateway
     clear_restarting
     exit ${rc}
     ;;
@@ -577,7 +718,10 @@ restart-kernel)
     # 只重启内核：管理服务与刷新守护进程原地不动。
     # config_callback 用它来应用新配置 —— 不再走 stop+start 全家桶，
     # 避免「切换订阅 → 应用被判停止 → 需要手动启动」。
+    # 顺带轮转日志：这是内核重启的最高频路径（切订阅/定时刷新都会走），
+    # info.log 的大头（mihomo 输出）在这里被周期性清掉。
     mark_restarting
+    rotate_logs
     restart_kernel
     rc=$?
     clear_restarting
