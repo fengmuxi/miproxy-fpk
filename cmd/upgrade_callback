@@ -17,23 +17,26 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 log_msg "upgrade_callback: 升级完成，启动服务..."
 
-# 同步新版 UI 与运行期脚本进数据目录。
-# 管理服务/网关优先从 ${TRIM_PKGVAR}/cmd、${TRIM_PKGVAR}/ui 启动（数据目录是
-# 唯一稳定路径），若不比对同步，升级 .fpk 只更新安装目录，页面与脚本会一直
-# 是旧版（「升级了但管理页没有新功能」的成因）。main start 里的 sync_cmd_scripts
-# 会同步 cmd/；UI 需要在这里单独比对拷贝。
-APP_DEST="${TRIM_APPDEST}"
-UI_TARGET="${TRIM_PKGVAR}/ui"
-if [ -d "${APP_DEST}/ui" ]; then
-    for _sub in zashboard metacubexd admin; do
-        [ -d "${APP_DEST}/ui/${_sub}" ] || continue
-        mkdir -p "${UI_TARGET}/${_sub}" 2>/dev/null
-        cp -rf "${APP_DEST}/ui/${_sub}/"* "${UI_TARGET}/${_sub}/" 2>/dev/null
-        log_msg "upgrade_callback: 已同步 ui/${_sub} 到数据目录"
-    done
-    for _f in index.html frame-zashboard.html frame-metacubexd.html config; do
-        [ -f "${APP_DEST}/ui/${_f}" ] && cp -f "${APP_DEST}/ui/${_f}" "${UI_TARGET}/${_f}" 2>/dev/null
-    done
+# 面板文件「先删后拷」整体重置到数据目录：升级 .fpk 只更新安装目录，
+# 数据目录（唯一稳定路径）里的 ui/ 若不重置，会被内核 /upgrade/ui 留下的
+# MetaCubeXD 残留污染（sw.js / _nuxt / workbox-* 等叠加覆盖清不掉），
+# 浏览器 Service Worker 还会继续钉住旧文件 —— 表现为「升级了但面板没恢复」。
+# sync_ui.sh 带备份与回滚；脚本本身由 main 的 sync_cmd_scripts 同步进数据目录，
+# 这里优先用同步后的副本，回退到本脚本同目录。
+SYNC_UI=""
+for p in "${TRIM_PKGVAR}/cmd/sync_ui.sh" "${SCRIPT_DIR}/sync_ui.sh" \
+         "${TRIM_APPDEST}/cmd/sync_ui.sh" "/var/apps/miproxy/cmd/sync_ui.sh" \
+         "/var/packages/miproxy/cmd/sync_ui.sh"; do
+    if [ -f "${p}" ]; then SYNC_UI="${p}"; break; fi
+done
+if [ -n "${SYNC_UI}" ]; then
+    if bash "${SYNC_UI}" >>"${LOG_FILE}" 2>&1; then
+        log_msg "upgrade_callback: 面板文件已重置到数据目录"
+    else
+        log_msg "upgrade_callback: 警告 - 面板重置失败（详见 sync_ui.log），管理界面「更新」页可手动修复"
+    fi
+else
+    log_msg "upgrade_callback: 警告 - 未找到 sync_ui.sh，跳过面板重置"
 fi
 
 bash "${SCRIPT_DIR}/main" start 2>>"${LOG_FILE}" || true

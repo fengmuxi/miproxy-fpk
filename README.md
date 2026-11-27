@@ -149,7 +149,7 @@
 | 代理与面板 | 代理端口、面板端口、代理用户名/密码、面板密钥、TUN 开关 |
 | 节点 | 列出 `config.yaml` 里**实际生效**的节点（名称 / 类型 / 地址 / 延迟），支持搜索、只看可用、单个或全部测速 |
 | 内核 | 检查 mihomo 官方最新版本、一键升级、按版本切换、恢复安装包内置内核、备份回滚、下载镜像前缀 |
-| 更新 | **应用本体（.fpk）在线自更新**：检查 GitHub 最新 Release、一键下载本机架构 `.fpk` 并走 fnOS 官方通道（`appcenter-cli`）升级整个应用，无需再手动下载上传应用中心 |
+| 更新 | **应用本体（.fpk）在线自更新**：检查 GitHub 最新 Release、一键下载本机架构 `.fpk` 并走 fnOS 官方通道（`appcenter-cli`）升级整个应用，无需再手动下载上传应用中心；另含**面板文件修复**——检查数据目录面板是否被内核「更新面板」污染（MetaCubeXD 残留），一键重置回安装包原版并重启内核 |
 | 日志 | 在线查看 `info.log` / `refresh_sub.log` / `install_callback.log` / `config_callback.log` / `upgrade_callback.log` / `admin.log`，支持 3 秒自动刷新（仅在该页生效） |
 
 节点页的行为约定：
@@ -177,6 +177,12 @@
 - 升级会重启整个应用（`appcenter-cli` 先跑 `upgrade_init` 停服务、装完 `upgrade_callback` 重启），代理会短暂中断，页面可能闪断属正常；完成后页面自动刷新。
 - **面板自带的「更新核心 / 更新面板」按钮**（Zashboard / MetaCubeXD 里）走的是 mihomo 内核的 `/upgrade`、`/upgrade/ui`，已被 9090 网关拦截并提示改用本通道或应用中心升级——避免内核默认面板包覆盖 MiProxy 自带 UI。
 - 内核版本（mihomo）仍走「内核」页独立管理，与应用本体（.fpk）互相独立。
+
+面板文件修复（「更新」页）的行为约定：
+
+- 「检查面板文件」读数据目录 `${VAR}/ui/zashboard`，若发现 MetaCubeXD 独有特征文件（`_nuxt`、`200.html`、`404.html`、`config.js` 等）或缺关键文件，标记「需修复」。
+- 「一键修复」调 `cmd/sync_ui.sh`：先备份当前 `ui/` → 整目录删旧拷新（安装目录的 `../ui` → 数据目录）→ 校验失败自动回滚备份 → 成功后 `main restart-kernel` 让 mihomo 重新挂载 `/ui`。
+- 服务端修好后若浏览器仍显示旧面板，是因为 **Service Worker 把旧文件钉在本地**：需在浏览器取消 Service Worker 并清除站点数据（页面上有操作指引）。
 
 行为约定：
 
@@ -657,6 +663,11 @@ changes ──┬─→ build-x86 ──┐
 ---
 
 ## 更新日志
+
+### v2.8.11
+- 🐛 修复（重要）：**「升级新版 .fpk 后 Zashboard 不恢复、仍显示 MetaCubeXD」**。根因：mihomo 的 `/upgrade/ui` 曾把内置默认面板 MetaCubeXD 解压进数据目录的 `ui/zashboard`，旧版升级只做「叠加覆盖」，清不掉 MetaCubeXD 残留的 `_nuxt`、`200.html`、`config.js`、`sw.js` 等文件，浏览器 Service Worker 还会继续钉住旧文件。本版把面板同步改为**「先删后拷」整体重置**
+- ✨ 新增：**面板文件一键修复（管理界面「更新」页）**。`cmd/sync_ui.sh` 先备份当前 `ui/` 到 `ui.bak-*`（保留最近一份，可回滚），源目录缺失/损坏时不动目标目录；整目录重置后校验，失败自动从备份恢复。并接入 `cmd/main` 的 start/restart/restart-kernel 入口做**启动自愈**（某次升级钩子没跑成，下次启动也会修好）；「更新」页新增「面板文件」卡片：`GET /api/panel/report` 只读诊断 + `POST /api/panel/restore` 一键重置并重启内核，服务端修好后提示在浏览器取消 Service Worker / 清除站点数据
+- 🐛 残留判定只用 MetaCubeXD 独有特征文件（`_nuxt`、`200.html`、`404.html`、`config.js`、`maskable-icon-512x512.png`、`pwa-64x64.png`）；`sw.js`、`workbox-*`、`manifest.webmanifest` 是 Zashboard 自身就带的，**不算残留、不误报**
 
 ### v2.8.10
 - ✨ 新增：**应用本体在线自更新（管理界面「更新」页）**。过去每次发版都要手动从 GitHub 下载 `.fpk` 再上传应用中心安装；现在可在管理页直接「检查更新 → 一键升级」：拉取 MiProxy 在 GitHub 的最新 Release，按本机架构（x86_64 / arm64）下载对应 `.fpk` 到 NAS 数据目录，校验后调 fnOS 自带的 `appcenter-cli install-fpk` 走**与「应用中心手动安装」完全等价**的标准升级通道（保留数据目录与 `settings.conf`、跑 `upgrade_init`/`upgrade_callback` 钩子）。全程页面轮询进度，升级会重启应用一次（代理短暂中断），完成后页面自动刷新

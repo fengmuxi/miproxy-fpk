@@ -2268,6 +2268,119 @@ def _adopt_appupdate_on_boot():
                               message=str(exc), finished_at=int(time.time()))
 
 
+# ---------------------------------------------------------------- 面板文件完整性（v2.8.11）
+
+# 数据目录里的面板由 mihomo external-ui 提供（config.yaml 的 external-ui / external-ui-name）。
+# mihomo 的 POST /upgrade/ui 会把内核默认面板 MetaCubeXD 解压进 ui/zashboard，
+# 旧版「叠加覆盖」式同步清不掉 MetaCubeXD 的残留（sw.js / _nuxt / workbox-* 等），
+# 升级新版 .fpk 后浏览器 Service Worker 仍钉住旧文件 → 面板不恢复。
+# sync_ui.sh 负责「先删后拷」整体重置；这里只做两件事：
+#   /api/panel/report    只读检查：当前面板目录里是否混入 MetaCubeXD 残留
+#   /api/panel/restore   调 sync_ui.sh 重置 + main restart-kernel（复用 _restart_kernel）
+
+# MetaCubeXD 独有的特征文件（出现在 zashboard 目录即视为被内核 /upgrade/ui 污染）。
+# 注意：sw.js / workbox-* / manifest.webmanifest 是 Zashboard 自己就带的，不能算残留；
+# 下面每一项都只在 MetaCubeXD 构建产物里出现。
+_PANEL_FOREIGN = ("_nuxt", "200.html", "404.html", "config.js",
+                  "maskable-icon-512x512.png", "pwa-64x64.png")
+
+
+def _ui_target_dir():
+    """mihomo 实际提供面板的目录：与 miproxy_config_lib.sh 的 UI_TARGET 一致。"""
+    return os.path.join(VAR_DIR, "ui")
+
+
+def panel_report():
+    """只读诊断：zashboard / metacubexd 目录是否健康、是否混入 MetaCubeXD 残留。
+
+    返回 200 + {ok, target, zashboard, metacubexd, foreign, need_restore}。
+    foreign 里出现的条目都指向「该目录混入了别的面板文件」。
+    """
+    target = _ui_target_dir()
+    zash = os.path.join(target, "zashboard")
+    meta = os.path.join(target, "metacubexd")
+
+    def dir_state(path):
+        info = {"exists": os.path.isdir(path), "files": 0, "missing_key": []}
+        if info["exists"]:
+            try:
+                for root, _dirs, files in os.walk(path):
+                    info["files"] += len(files)
+            except OSError:
+                pass
+            for key in ("index.html",):
+                if not os.path.isfile(os.path.join(path, key)):
+                    info["missing_key"].append(key)
+        return info
+
+    # 残留检测：MetaCubeXD 独有的构建产物出现在 zashboard 里（内核 /upgrade/ui 污染）。
+    # 只用 _nuxt / 200.html / 404.html / config.js 等 MetaCubeXD 独有项，避免误报
+    # （sw.js、workbox-*、manifest.webmanifest 是 Zashboard 自己带的，不算残留）。
+    foreign = []
+    if os.path.isdir(zash):
+        for entry in os.listdir(zash):
+            if entry in _PANEL_FOREIGN:
+                foreign.append("zashboard/" + entry)
+
+    z_state = dir_state(zash)
+    m_state = dir_state(meta)
+    need = bool(foreign) or not z_state["exists"] or bool(z_state["missing_key"])
+
+    return 200, {
+        "ok": True,
+        "target": target,
+        "zashboard": z_state,
+        "metacubexd": m_state,
+        "foreign": foreign,
+        "need_restore": need,
+        "note": ("检测到 MetaCubeXD 残留或 Zashboard 关键文件缺失，建议「一键修复」"
+                  if need else "面板目录看起来正常"),
+    }
+
+
+def panel_restore():
+    """整目录重置面板文件并重启内核。
+
+    1. 跑 cmd/sync_ui.sh（先删后拷 + 备份回滚，见该脚本头部说明）
+    2. 复用 _restart_kernel 重启 mihomo（保留管理服务），让它重新挂载 /ui
+    成功返回 200 + {ok, restarted, sync_log}；失败 400 + {ok:False, error, sync_log}。
+    """
+    main_script, tried = find_cmd_script("main")
+    sync_script, _ = find_cmd_script("sync_ui.sh")
+    if not sync_script:
+        sync_script = os.path.join(os.path.dirname(main_script), "sync_ui.sh") if main_script else ""
+    if not os.path.isfile(sync_script):
+        return 400, {"ok": False, "error": "找不到 sync_ui.sh（已查找：%s）。"
+                   "常见原因：应用刚升级完仍从系统临时解包目录运行，到 fnOS 应用中心重启一次 MiProxy 即可。"
+                   % "、".join(tried or ["cmd"])}
+
+    env = os.environ.copy()
+    env["TRIM_PKGVAR"] = VAR_DIR
+    env["TRIM_PKGETC"] = ETC_DIR
+    if APP_DEST:
+        env["TRIM_APPDEST"] = APP_DEST
+    try:
+        proc = subprocess.run([bash_bin(), sync_script], env=env,
+                              capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=120)
+    except subprocess.TimeoutExpired:
+        return 400, {"ok": False, "error": "sync_ui.sh 超时（120s）"}
+    sync_tail = (proc.stdout or proc.stderr or "").strip()
+    if proc.returncode != 0:
+        return 400, {"ok": False,
+                     "error": "面板文件重置失败（exit %s）：详见 sync_ui.log" % proc.returncode,
+                     "sync_log": sync_tail[-800:]}
+
+    # 重置成功后重启内核，让 mihomo 重新挂载 /ui（管理服务保持存活）
+    try:
+        ok, detail = _restart_kernel()
+    except KernelError as exc:
+        ok, detail = False, str(exc)
+    return 200, {"ok": True, "restarted": ok,
+                 "note": "内核重启成功" if ok else ("内核重启异常：" + (detail or "")[:200]),
+                 "sync_log": sync_tail[-800:]}
+
+
 # ---------------------------------------------------------------- 状态汇总
 
 def build_status():
@@ -2430,6 +2543,10 @@ class Handler(BaseHTTPRequestHandler):
             code, data = check_app_updates()
             return self._json(code, data)
 
+        if path == "/api/panel/report":
+            code, data = panel_report()
+            return self._json(code, data)
+
         if path == "/api/logs":
             query = parse_qs(parsed.query)
             name = (query.get("name", ["info"])[0] or "info").strip()
@@ -2520,6 +2637,10 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as exc:  # noqa: BLE001
                     return self._json(400, {"error": "JSON 解析失败: %s" % exc})
             code, resp = start_app_update(data)
+            return self._json(code, resp)
+
+        if parsed.path == "/api/panel/restore":
+            code, resp = panel_restore()
             return self._json(code, resp)
 
         if parsed.path in ("/api/kernel/check", "/api/kernel/install",

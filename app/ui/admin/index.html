@@ -83,6 +83,8 @@
 
   .muted{color:var(--muted);font-size:12.5px}
   .tag{font-size:11.5px;padding:2px 8px;border-radius:999px;background:#eef0fb;color:#5b62b8}
+  .tag.warn{background:#fff3e0;color:#b26a00}
+  .tag.ok{background:#e8f7ee;color:#1c7a4a}
 
   /* 按钮 */
   .btn{border:none;border-radius:9px;padding:10px 18px;font-size:14px;font-weight:600;cursor:pointer;transition:.15s}
@@ -521,6 +523,23 @@
       <span class="muted" id="aTaskPct">0%</span>
     </div>
     <pre class="k-log" id="aTaskLog" style="display:none"></pre>
+  </div>
+
+  <div class="card">
+    <h2>面板文件修复 <span class="tag" id="pStateTag">—</span></h2>
+    <div class="hint">检查数据目录里的面板是否被内核「更新面板」按钮污染（MetaCubeXD 残留导致 Zashboard 消失 / 显示异常），并一键重置回安装包原版。</div>
+    <div class="err-list" id="pIssues"></div>
+    <div class="actions">
+      <button class="btn ghost" id="pCheckBtn" type="button">检查面板文件</button>
+      <button class="btn primary" id="pFixBtn" type="button" disabled>一键修复</button>
+      <span class="muted" id="pHint">未检查</span>
+    </div>
+    <div class="err-list" id="pErr"></div>
+    <div class="hint" style="margin-bottom:0;margin-top:10px">
+      「一键修复」会重置面板文件并重启内核（代理短暂中断）；若修复后仍显示旧面板，
+      请在浏览器里<b>取消 Service Worker 并清除站点数据</b>（F12 → Application →
+      Service Workers → Unregister，再 Clear site data），或换无痕窗口打开。
+    </div>
   </div>
 
   <div class="card">
@@ -1507,6 +1526,7 @@
       if (snap.state === "error") $("aErr").innerHTML = "<li>" + esc(snap.error || "上一轮升级失败") + "</li>";
       else $("aErr").innerHTML = "";
       if (snap.state === "running") pollAppTask();
+      loadPanel();
       return api("/api/appupdate/check").then(function (r) {
         if (r.arch) $("aArch").textContent = r.arch.machine + " → " + r.arch.asset;
         var latest = r.latest || null;
@@ -1559,6 +1579,59 @@
       pollAppTask();
     }).catch(function (e) {
       toast("启动升级失败：" + e.message, "err");
+    });
+  }
+
+  // 面板文件完整性：检查数据目录是否被 MetaCubeXD 残留污染，并可一键重置
+  function loadPanel() {
+    var fixBtn = $("pFixBtn");
+    if (fixBtn) fixBtn.disabled = true;
+    $("pStateTag").textContent = "检查中…";
+    $("pHint").textContent = "检查中…";
+    api("/api/panel/report").then(function (r) {
+      var issues = $("pIssues");
+      var foreign = r.foreign || [];
+      var missing = (r.zashboard && r.zashboard.missing_key) || [];
+      var lines = [];
+      if (foreign.length) lines.push("检测到 MetaCubeXD 残留：");
+      foreign.slice(0, 8).forEach(function (f) { lines.push("· " + f); });
+      if (foreign.length > 8) lines.push("· …（共 " + foreign.length + " 项）");
+      missing.forEach(function (m) { lines.push("· Zashboard 缺关键文件 " + m); });
+      if (!r.zashboard || !r.zashboard.exists) lines.push("· Zashboard 目录不存在");
+      issues.innerHTML = lines.length
+        ? lines.map(function (l) { return "<li>" + esc(l) + "</li>"; }).join("")
+        : "";
+      var need = r.need_restore;
+      $("pStateTag").textContent = need ? "需修复" : "正常";
+      $("pStateTag").className = "tag" + (need ? " warn" : " ok");
+      var fixBtn2 = $("pFixBtn");
+      if (fixBtn2) fixBtn2.disabled = !need;
+      $("pHint").textContent = need ? (r.note || "建议一键修复") : (r.note || "面板目录看起来正常");
+    }).catch(function (e) {
+      $("pStateTag").textContent = "失败";
+      $("pHint").textContent = "检查失败：" + e.message;
+      $("pErr").innerHTML = "";
+    });
+  }
+
+  function fixPanel() {
+    if (!window.confirm("一键修复面板文件？\n\n将重置数据目录里的面板为安装包原版（自动备份），并重启内核（代理短暂中断）。\n若修复后仍显示旧面板，请在浏览器取消 Service Worker 并清除站点数据。")) return;
+    var btn = $("pFixBtn");
+    btn.disabled = true; btn.textContent = "修复中…";
+    api("/api/panel/restore", { method: "POST", body: JSON.stringify({}) }).then(function (r) {
+      if (r.ok) {
+        toast("面板已重置" + (r.restarted ? "，内核已重启" : "，但内核重启异常"), "ok");
+        loadPanel();
+        // 内核重启后服务短暂闪断，稍后重载
+        setTimeout(function () { loadPanel(); }, 2500);
+      } else {
+        $("pErr").innerHTML = "<li>" + esc(r.error || "修复失败") + "</li>";
+        toast("面板修复失败：" + (r.error || "未知"), "err");
+      }
+      btn.textContent = "一键修复";
+    }).catch(function (e) {
+      $("pErr").innerHTML = "<li>" + esc("修复失败：" + e.message) + "</li>";
+      btn.disabled = false; btn.textContent = "一键修复";
     });
   }
 
@@ -1782,6 +1855,8 @@
     // 应用自更新
     $("aCheckBtn").onclick = checkAppUpdate;
     $("aUpgradeBtn").onclick = upgradeApp;
+    $("pCheckBtn").onclick = loadPanel;
+    $("pFixBtn").onclick = fixPanel;
     $("aTaskShowLog").onclick = function () {
       var el = $("aTaskLog");
       el.style.display = el.style.display === "none" ? "block" : "none";

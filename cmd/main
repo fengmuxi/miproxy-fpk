@@ -386,7 +386,7 @@ sync_cmd_scripts() {
     local dest="${TRIM_PKGVAR}/cmd"
     mkdir -p "${dest}" 2>/dev/null
     local name
-    for name in main admin_server.py config_callback refresh_sub sub_download.sh miproxy_config_lib.sh sub_convert.py gateway.py; do
+    for name in main admin_server.py config_callback refresh_sub sub_download.sh miproxy_config_lib.sh sub_convert.py gateway.py sync_ui.sh; do
         [ -f "${src_dir}/${name}" ] || continue
         # 每次都比对内容：只在「不存在时复制」会让升级后数据目录里的旧副本一直生效
         if ! cmp -s "${src_dir}/${name}" "${dest}/${name}" 2>/dev/null; then
@@ -406,6 +406,30 @@ sync_cmd_scripts() {
     if [ -f "${src_dir}/sub_convert.py" ] && [ ! -f "${TRIM_PKGVAR}/sub_convert.py" ]; then
         cp -f "${src_dir}/sub_convert.py" "${TRIM_PKGVAR}/sub_convert.py" 2>/dev/null
     fi
+}
+
+# 启动前重置数据目录的面板文件（先删后拷，清掉内核 /upgrade/ui 留下的
+# MetaCubeXD 残留：sw.js / _nuxt / workbox-* 等，见 cmd/sync_ui.sh 头部说明）。
+# 在 main 里跑一次是「自愈」通道：即使某次 .fpk 升级后 upgrade_callback 没
+# 跑成，下次启动也会把面板修回安装包里的原版。失败不阻塞启动（旧文件还在，
+# 管理界面「更新」页仍可手动「一键修复」）。
+sync_ui() {
+    local script
+    for p in "${TRIM_PKGVAR}/cmd/sync_ui.sh" "${TRIM_APPDEST}/cmd/sync_ui.sh" \
+             "/var/apps/miproxy/cmd/sync_ui.sh" "/var/packages/miproxy/cmd/sync_ui.sh" \
+             "${MAIN_DIR}/sync_ui.sh"; do
+        if [ -f "${p}" ]; then script="${p}"; break; fi
+    done
+    if [ -z "${script}" ]; then
+        log_msg "未找到 sync_ui.sh，跳过面板重置"
+        return 0
+    fi
+    if bash "${script}" >>"${LOG_FILE}" 2>&1; then
+        log_msg "sync_ui: 面板文件重置完成"
+    else
+        log_msg "警告: 面板重置失败（详见 ${TRIM_PKGVAR}/sync_ui.log），管理界面「更新」页可手动修复"
+    fi
+    return 0
 }
 
 find_admin_script() {
@@ -683,6 +707,7 @@ stop_process() {
 case "$1" in
 start)
     rotate_logs
+    sync_ui
     start_process
     rc=$?
     # 无论内核是否成功都启动管理服务与统一入口网关，便于在界面里排查/修正配置
@@ -707,6 +732,7 @@ restart)
     rotate_logs
     stop_process
     sleep 2
+    sync_ui
     start_process
     rc=$?
     start_admin
@@ -722,6 +748,7 @@ restart-kernel)
     # info.log 的大头（mihomo 输出）在这里被周期性清掉。
     mark_restarting
     rotate_logs
+    sync_ui
     restart_kernel
     rc=$?
     clear_restarting

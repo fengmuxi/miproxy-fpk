@@ -246,6 +246,8 @@ miproxy-fpk/
 
 42. **网关拦截 mihomo 自升级端点（v2.8.10）——「Zashboard 点更新后变成 MetaCubeXD」的根因与对策**：Zashboard / MetaCubeXD 面板里的「更新核心 / 更新控制面板」按钮会经 9090 网关打到 mihomo 内核的 `POST /upgrade`、`POST /upgrade/ui`。MiProxy 的 config.yaml **没有设 `external-ui-url`**，内核就用内置默认面板 zip（**MetaCubeXD**）下载解压到 `external-ui` 目录（`${VAR}/ui/`），把 MiProxy 自带的 Zashboard / 选择页文件整个覆盖掉；面板随后 `window.location.reload()`，用户看到的就是「Zashboard 消失、变成 MetaCubeXD」。`POST /upgrade` 同理——它绕过 MiProxy 自己的内核管理链路（备份 / 回滚 / `restart-kernel` / RESTART_FLAG）直接换内核。对策在 `cmd/gateway.py`：`UPGRADE_BLOCK` 把 `POST /upgrade`、`POST /upgrade/ui`（query 剥掉后精确匹配，GET 放行）拦在网关层，返回 **400 + 中文说明 JSON**——400 让面板按钮走 catch 分支弹错误提示、**不触发 reload 也覆盖不了 UI 目录**。面板升级走 `.fpk`、内核升级走管理界面「内核」页，不要再把内核自升级端点放通。
 
+44. **面板文件「先删后拷」整体重置（v2.8.11）——升级 .fpk 后 Zashboard 不恢复的根治**：内核 `/upgrade/ui` 污染进 `${VAR}/ui/zashboard` 的 MetaCubeXD 残留（`_nuxt`、`200.html`、`404.html`、`config.js` 等）用「叠加覆盖」清不掉，且浏览器 **Service Worker 会继续钉住旧文件**——这是「升级到 2.8.10 后面板还是旧前端」的根因。对策：`cmd/sync_ui.sh` 负责「先删后拷」整体重置面板（备份 `ui.bak-*` 可回滚、缺源/损坏不动目标），并接入三处自愈：`cmd/main` 的 `start`/`restart`/`restart-kernel` 入口都调一次 `sync_ui`（装完/升级后下次启动自动修好，失败不阻塞启动）；`upgrade_callback` 改为调 `sync_ui.sh`（替代旧的叠加 `cp`）；管理界面「更新」页新增「面板文件」卡片——`GET /api/panel/report` 只读诊断（`_PANEL_FOREIGN` 只列 MetaCubeXD 独有文件，**不含** `sw.js`/`workbox-*`/`manifest.webmanifest`，那些是 Zashboard 自带、不能误报）、`POST /api/panel/restore` 调 `sync_ui.sh` 重置 + 复用 `_restart_kernel` 重启内核让 mihomo 重新挂载 `/ui`。**前端务必提示用户**：服务端文件修好后，若仍显示旧面板，需在浏览器取消 Service Worker（F12 → Application → Service Workers → Unregister）并清除站点数据。残留判定的文件清单要与 `app/ui/zashboard` 与 `app/ui/metacubexd` 的**实际差异**保持同步——改面板构建产物时先核对该清单，避免误报或漏报。
+
 ---
 
 ## 10. 安全红线
