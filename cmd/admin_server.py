@@ -1307,6 +1307,7 @@ def kernel_task_snapshot():
 # 镜像前缀只对官方 GitHub 地址生效：镜像服务（如 ghfast.top）认得的是原始 GitHub URL，
 # 给自建/本地地址套前缀只会拼出无效地址。
 MIRROR_HOSTS = ("github.com", "api.github.com", "objects.githubusercontent.com",
+                "release-assets.githubusercontent.com",
                 "codeload.github.com", "raw.githubusercontent.com")
 
 
@@ -1942,11 +1943,15 @@ def check_app_updates():
             errors.append("%s -> %s" % (base, exc))
 
     if not releases:
+        # 即使 GitHub API 超时，也把本地探测到的架构回给前端 —— 否则页面「设备架构」
+        # 一直显示「—」，用户误以为检测没跑，其实只是网络拿不到 Release。
         return 200, {
             "ok": False,
             "current": _app_current_version(),
+            "arch": {"machine": machine, "asset": asset_arch},
             "error": "无法获取 Release 信息：%s" % ("；".join(errors[-2:]) or "未知错误"),
-            "hint": "可填写下载镜像前缀（如 https://ghfast.top/）后重试",
+            "hint": "可填写下载镜像前缀（如 https://ghfast.top/）后重试；"
+                    "升级下载已内置多镜像自动回退，可直接点「升级到最新」尝试",
         }
 
     target = next((r for r in releases if r["arch"] == asset_arch), None)
@@ -2059,32 +2064,104 @@ def start_app_update(req):
     return 202, {"ok": True, "task_id": task_id, "task": app_task_snapshot()}
 
 
+# 内置下载镜像（GitHub 资产在国内直连经常读超时 / RemoteDisconnected：
+# github.com 会 302 到 release-assets.githubusercontent.com，该域名链路极不稳）。
+# 顺序：用户自定义镜像 → 内置镜像 → 官方直连。每个源失败自动切下一个，带断点续传。
+BUILTIN_FPK_MIRRORS = ("https://ghfast.top/", "https://gh-proxy.com/")
+_FPK_READ_TIMEOUT = 60          # 单次 socket 读超时（原 30s 在国内链路上太短）
+_FPK_MAX_ROUNDS = 6             # 所有源合计最多尝试轮次（防死循环）
+
+
+def _fpk_source_urls(url, mirror):
+    """生成候选下载地址（去重、保序）：用户镜像 → 内置镜像 → 直连。"""
+    urls = []
+    custom = (mirror or "").strip()
+    if custom:
+        urls.append(_apply_mirror(url, custom))
+    for m in BUILTIN_FPK_MIRRORS:
+        urls.append(_apply_mirror(url, m))
+    urls.append(url)
+    out, seen = [], set()
+    for u in urls:
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
 def _download_fpk(url, dest, mirror=""):
-    """下载到 dest。url 已含镜像前缀则直用；否则对 GitHub 官方域名套镜像前缀。"""
-    target_url = _apply_mirror(url, mirror) if url.startswith("https://github.com") else url
-    total = 0
-    try:
-        with _open_url(target_url, 30) as resp:
-            cl = to_int(resp.headers.get("Content-Length"), 0)
-            done = 0
-            with open(dest, "wb") as fh:
-                while True:
-                    chunk = resp.read(131072)
-                    if not chunk:
-                        break
-                    fh.write(chunk)
-                    done += len(chunk)
-                    total = done
-                    pct = 5 + (done / cl * 65 if cl else 0)
-                    _save_appupdate_state(percent=round(min(pct, 70), 1),
-                                          message="已下载 %.1f MB%s" % (
-                                              done / 1048576.0,
-                                              " / %.1f MB" % (cl / 1048576.0) if cl else ""))
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
-        raise KernelError("下载失败：%s（可填镜像前缀后重试）" % exc)
-    if total == 0:
-        raise KernelError("下载内容为空")
-    return total
+    """下载 .fpk 到 dest：多镜像自动回退 + Range 断点续传 + 重试。
+
+    国内从 GitHub 下载 37MB 资产时，github.com 会重定向到
+    release-assets.githubusercontent.com，该链路常见「连上后 30s 读不到数据」
+    （The read operation timed out）或中途 RemoteDisconnected。原实现只有一个源、
+    30s 超时、失败即报错，用户只能手填镜像——但页面此时架构/版本又显示为空，
+    体验很差。现在自动在多个源之间切换并续传，全程只在最后仍失败时才报错。
+    """
+    sources = _fpk_source_urls(url, mirror)
+    done = 0                       # 已在 dest 里落盘的字节数
+    total_size = 0
+    last_err = ""
+    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+
+    for round_no in range(_FPK_MAX_ROUNDS):
+        src = sources[round_no % len(sources)]
+        if round_no >= len(sources) and done > 0:
+            # 所有源都试过一轮且已有部分数据：再从第一个源续传一轮
+            pass
+        headers = {"User-Agent": "MiProxyAdmin/1.0 (+fnOS)",
+                   "Accept": "application/octet-stream, */*"}
+        if done > 0:
+            headers["Range"] = "bytes=%d-" % done
+        req = urllib.request.Request(src, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=_FPK_READ_TIMEOUT) as resp:
+                status = getattr(resp, "status", 200)
+                cl = to_int(resp.headers.get("Content-Length"), 0)
+                if done > 0 and status == 200 and not resp.headers.get("Content-Range"):
+                    # 源不支持续传，从头重写
+                    done = 0
+                if cl and not resp.headers.get("Content-Range"):
+                    total_size = done + cl
+                mode = "ab" if done > 0 else "wb"
+                with open(dest, mode) as fh:
+                    while True:
+                        try:
+                            chunk = resp.read(131072)
+                        except (socket.timeout, TimeoutError) as exc:
+                            last_err = "读取超时: %s" % exc
+                            break  # 切源续传
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                        fh.flush()
+                        done += len(chunk)
+                        pct = 5 + (done / total_size * 65 if total_size else 0)
+                        _save_appupdate_state(
+                            percent=round(min(pct, 70), 1),
+                            message="已下载 %.1f MB%s（源 %d/%d）" % (
+                                done / 1048576.0,
+                                " / %.1f MB" % (total_size / 1048576.0) if total_size else "",
+                                round_no % len(sources) + 1, len(sources)))
+                if done > 0 and total_size and done >= total_size:
+                    _task_log_update("下载完成（%.1f MB）" % (done / 1048576.0))
+                    return done
+                if done > 0 and not total_size:
+                    # 无 Content-Length（某些镜像）：读到大块数据且正常结束即视为完成
+                    _task_log_update("下载完成（%.1f MB，源未返回总长度）" % (done / 1048576.0))
+                    return done
+                last_err = last_err or "连接提前结束（%d/%s 字节）" % (done, total_size or "?")
+                _task_log_update("源 %d 未完成（%s），切换下一个续传" % (round_no % len(sources) + 1, last_err))
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as exc:
+            last_err = "%s: %s" % (type(exc).__name__, exc)
+            _task_log_update("源 %d 失败（%s），切换下一个" % (round_no % len(sources) + 1, last_err))
+            continue
+
+    if done > 0:
+        # 多轮后仍不完整：保留已下载部分供下一轮 Range 续传，但本次判失败
+        raise KernelError("下载不完整（%.1f/%.1f MB）：%s；重试或在「内核」页换镜像前缀"
+                          % (done / 1048576.0, total_size / 1048576.0 if total_size else 0, last_err))
+    raise KernelError("下载失败：%s；可填镜像前缀后重试" % last_err)
 
 
 def _cli_capabilities(cli):

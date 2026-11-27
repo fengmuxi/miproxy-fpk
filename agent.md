@@ -256,3 +256,5 @@ miproxy-fpk/
 - `secret`、`wizard_proxy_pass` 等敏感字段只写进 `settings.conf`（仅本机 root 可读），不要回显到日志或前端（管理接口只返回 `*_set` 布尔值）。
 - 管理服务（9091）监听 `0.0.0.0`：无密钥时**只读放行、写操作全拒**（`_write_blocked()`）。新增接口必须走 `_authorized()`，静态资源必须保留 `_serve_static` 的路径穿越校验，日志读取必须限制在 `LOG_WHITELIST`。
 - 不要提交真实订阅 URL、密钥、凭据到仓库。
+
+43. **应用自更新下载 .fpk 的三大坑（v2.8.12）**：① `github.com/.../releases/download/...` 会 302 到 `release-assets.githubusercontent.com`，国内链路经常连上后读超时（错误文本 `The read operation timed out` 就是 `socket.timeout`），而 api.github.com（检查更新）往往正常——所以「检查成功、下载失败」是常态不是 bug；② `urlopen(timeout=30)` 的 timeout 是**单次 socket 读**超时、不是整个下载超时，30s 偏短，已提到 60s；③ 必须多源回退 + Range 断点续传：`BUILTIN_FPK_MIRRORS` 内置 ghfast/gh-proxy，`_fpk_source_urls()` 按「用户镜像→内置→直连」生成候选，`_download_fpk()` 逐源尝试并用 `Range: bytes=N-` 续传。新增镜像域名要同步 `MIRROR_HOSTS`（含 release-assets）。`check_app_updates()` 失败时也要返回本地 arch，否则页面「设备架构」显示空。

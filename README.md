@@ -664,6 +664,9 @@ changes ──┬─→ build-x86 ──┐
 
 ## 更新日志
 
+### v2.8.12
+- 🐛 修复：**应用内「更新」页升级到最新时，下载 .fpk 卡在 5% 并提示「下载失败：The read operation timed out」**。根因是 GitHub Release 资产 URL 会 302 重定向到 `release-assets.githubusercontent.com`，该域名在国内链路上经常「连上但 30 秒读不到数据」，而原下载器只有一个源、30 秒读超时、失败即放弃。现在下载器自动按「你填的镜像 → 内置 ghfast.top / gh-proxy.com → 官方直连」逐个尝试，失败自动切源并用 HTTP Range **断点续传**已下载部分，读超时放宽到 60 秒，进度按源与字节数实时更新；实测国内直连会断、ghfast 可稳定下载（约 270 KB/s）。另外：镜像白名单补上 `release-assets.githubusercontent.com`；即使 GitHub API 超时，页面也会显示本机架构而不再是「—」
+
 ### v2.8.11
 - 🐛 修复（重要）：**「升级新版 .fpk 后 Zashboard 不恢复、仍显示 MetaCubeXD」**。根因：mihomo 的 `/upgrade/ui` 曾把内置默认面板 MetaCubeXD 解压进数据目录的 `ui/zashboard`，旧版升级只做「叠加覆盖」，清不掉 MetaCubeXD 残留的 `_nuxt`、`200.html`、`config.js`、`sw.js` 等文件，浏览器 Service Worker 还会继续钉住旧文件。本版把面板同步改为**「先删后拷」整体重置**
 - ✨ 新增：**面板文件一键修复（管理界面「更新」页）**。`cmd/sync_ui.sh` 先备份当前 `ui/` 到 `ui.bak-*`（保留最近一份，可回滚），源目录缺失/损坏时不动目标目录；整目录重置后校验，失败自动从备份恢复。并接入 `cmd/main` 的 start/restart/restart-kernel 入口做**启动自愈**（某次升级钩子没跑成，下次启动也会修好）；「更新」页新增「面板文件」卡片：`GET /api/panel/report` 只读诊断 + `POST /api/panel/restore` 一键重置并重启内核，服务端修好后提示在浏览器取消 Service Worker / 清除站点数据
