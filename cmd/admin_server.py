@@ -39,6 +39,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import urllib.error
@@ -1757,6 +1758,516 @@ def save_kernel_mirror(data):
     return 200, {"ok": True, "mirror": mirror}
 
 
+# ---------------------------------------------------------------- 应用本体自更新（.fpk 在线升级）
+#
+# 为什么需要：过去每次发版，用户要从 GitHub 下载 .fpk、再上传到 fnOS 应用中心
+# 手动安装。现在管理页可以直接「检查更新 → 下载到 NAS → 一键升级」。
+#
+# 实现边界（关键）：
+#  1. **不自己解压替换 /var/apps/miproxy**：.fpk 是 fnOS 应用中心管理的目录，
+#     手工覆盖会绕过应用中心的升级钩子与版本登记。正确通道是 fnOS 预装的
+#     `appcenter-cli install-fpk <路径>`——它走与「手动上传安装」完全相同的标准
+#     升级流程（upgrade_init 停服务 → 替换安装文件 → upgrade_callback 启动 →
+#     保留数据目录与 settings.conf）。
+#  2. **下载源白名单**：与内核管理一致，Release 仓库写死在代码里（不信任前端），
+#     可配置镜像前缀只对官方 GitHub 域名生效。
+#  3. **进程死亡窗口**：`appcenter-cli install-fpk` 会先跑 upgrade_init（main stop），
+#     本管理服务和网关一起被停掉，之后由 fnOS 的 upgrade_callback 重新拉起。
+#     所以任务结果不能只留在内存：下载/校验/命令完成各阶段都写 APPUPDATE_STATE
+#     文件；新进程启动时（main()）若发现 pending 标记就补记成功。
+#  4. **失败回滚**：appcenter-cli 失败（rc≠0）不会破坏旧安装（fnOS 升级失败会
+#     保留旧版），旧版本进程由 upgrade_callback 之外的巡检拉起；任务状态里记录
+#     下载命令与完整输出供排障。
+
+APPUPDATE_STATE_FILE = os.path.join(VAR_DIR, "appupdate.json")
+
+# 应用本体仓库（运维开关可覆盖，不接受前端传参）
+APP_REPO = os.environ.get("MIPROXY_APP_REPO", "fengmuxi/miproxy-fpk")
+APP_DL_BASE = os.environ.get("MIPROXY_APP_DL_BASE", "https://github.com/%s/releases/download" % APP_REPO)
+# 资产名里的架构后缀必须与 manifest 的 platform 一致
+APP_ASSET_ARCH = {
+    "x86_64": "x86_64", "amd64": "x86_64",
+    "aarch64": "arm64", "arm64": "arm64",
+}
+APP_UPDATE_TASK = {
+    "state": "idle", "phase": "", "percent": 0, "message": "", "error": "",
+    "started_at": 0, "finished_at": 0, "result": {}, "log": [],
+}
+APP_UPDATE_TASK_LOCK = threading.Lock()
+_app_cli_path = None
+
+
+def _task_log_update(line):
+    stamp = time.strftime("%H:%M:%S")
+    with APP_UPDATE_TASK_LOCK:
+        log = APP_UPDATE_TASK.get("log") or []
+        log.append("%s %s" % (stamp, line))
+        APP_UPDATE_TASK["log"] = log[-40:]
+
+
+def app_task_snapshot():
+    with APP_UPDATE_TASK_LOCK:
+        snap = dict(APP_UPDATE_TASK)
+        snap["log"] = list(APP_UPDATE_TASK.get("log") or [])
+        snap["result"] = dict(APP_UPDATE_TASK.get("result") or {})
+    # 升级会杀掉本进程：新进程内存态是 idle，磁盘文件里才有上一轮的真实进度。
+    # 谁更近用谁（按 started_at 比）。
+    state = appupdate_state()
+    if state and to_int(state.get("started_at"), 0) > to_int(snap.get("started_at"), 0):
+        snap["state"] = state.get("state") or "idle"
+        snap["phase"] = state.get("phase") or ""
+        snap["percent"] = to_int(state.get("percent"), 0)
+        snap["message"] = state.get("message") or ""
+        snap["error"] = state.get("error") or ""
+        snap["started_at"] = to_int(state.get("started_at"), 0)
+        snap["finished_at"] = to_int(state.get("finished_at"), 0)
+        snap["result"] = dict(state.get("result") or {})
+        snap["log"] = list(state.get("log") or [])
+    return snap
+
+
+def app_task_running():
+    with APP_UPDATE_TASK_LOCK:
+        return APP_UPDATE_TASK.get("state") == "running"
+
+
+def appupdate_state():
+    try:
+        with open(APPUPDATE_STATE_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _save_appupdate_state(**kw):
+    state = appupdate_state() or {}
+    state.update(kw)
+    try:
+        tmp = APPUPDATE_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, APPUPDATE_STATE_FILE)
+    except OSError:
+        pass
+
+
+def _app_machine_arch():
+    machine, _asset_arch = detect_arch()
+    asset_arch = APP_ASSET_ARCH.get(machine, machine or "x86_64")
+    return machine, asset_arch
+
+
+def _app_current_version():
+    """当前安装版本：manifest 的 version。
+
+    探测顺序：target 目录 → 数据目录 → target 的上级（应用根 /var/apps/miproxy）
+    → 常见安装布局。manifest 在应用根目录，TRIM_APPDEST 是 target，所以要把
+    上级目录也算进来，否则读不到版本号、升级成功判定会误报。
+    """
+    import posixpath
+    candidates = [APP_DEST, VAR_DIR]
+    if APP_DEST:
+        candidates.append(posixpath.dirname(APP_DEST.rstrip("/")))
+    candidates += ["/var/apps/miproxy", "/var/packages/miproxy"]
+    for base in candidates:
+        if not base:
+            continue
+        try:
+            with open(os.path.join(base, "manifest"), encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("version"):
+                        return line.split("=", 1)[1].strip()
+        except OSError:
+            continue
+    return ""
+
+
+def find_appcenter_cli():
+    """定位 fnOS 自带的 appcenter-cli。"""
+    global _app_cli_path
+    if _app_cli_path:
+        return _app_cli_path
+    found = shutil.which("appcenter-cli")
+    if not found:
+        for p in ("/usr/bin/appcenter-cli", "/usr/local/bin/appcenter-cli",
+                  "/opt/fnnas/appcenter-cli", "/bin/appcenter-cli"):
+            if os.path.isfile(p):
+                found = p
+                break
+    _app_cli_path = found
+    return found
+
+
+def check_app_updates():
+    """拉取最新 Release（镜像优先、直连兜底），按本机架构挑 .fpk 资产。
+
+    只读操作：即使已有更新任务在跑也返回 200（running 字段置位），
+    前端可以边下载边轮询检查。
+    """
+    machine, asset_arch = _app_machine_arch()
+    api_base = "https://api.github.com/repos/%s" % APP_REPO
+    state = read_kernel_state()
+    mirror = state.get("mirror") or ""
+
+    releases = []
+    errors = []
+    url = api_base + "/releases/latest"
+    seen, bases = set(), []
+    for candidate in ([_apply_mirror(url, mirror), url] if mirror else [url]):
+        if candidate not in seen:
+            seen.add(candidate)
+            bases.append(candidate)
+    for base in bases:
+        try:
+            data = _http_json(base, 15)
+            tag = str(data.get("tag_name") or "")
+            if not tag:
+                return 200, {"ok": False, "error": "未获取到最新版本号", "current": _app_current_version()}
+            release = {"tag": tag, "published_at": str(data.get("published_at") or "")}
+            for a in data.get("assets") or []:
+                name = str(a.get("name") or "")
+                m = re.match(r"^miproxy-([\d.]+)-(\w+)\.fpk$", name)
+                if not m:
+                    continue
+                releases.append({
+                    "tag": tag,
+                    "asset": name,
+                    "arch": m.group(2),
+                    "size": to_int(a.get("size"), 0),
+                    "url": a.get("browser_download_url") or "",
+                })
+            break
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as exc:
+            errors.append("%s -> %s" % (base, exc))
+
+    if not releases:
+        return 200, {
+            "ok": False,
+            "current": _app_current_version(),
+            "error": "无法获取 Release 信息：%s" % ("；".join(errors[-2:]) or "未知错误"),
+            "hint": "可填写下载镜像前缀（如 https://ghfast.top/）后重试",
+        }
+
+    target = next((r for r in releases if r["arch"] == asset_arch), None)
+    cur = _app_current_version().lstrip("v")
+    return 200, {
+        "ok": bool(target),
+        "current": _app_current_version(),
+        "arch": {"machine": machine, "asset": asset_arch},
+        "latest": target,
+        "releases": releases,
+        # tag 形如 v2.9.0，manifest version 形如 2.9.0：都去掉前缀 v 再比
+        "update_available": bool(target and target["tag"].lstrip("v") != cur),
+        "repo": APP_REPO,
+    }
+
+
+def _verify_fpk(path):
+    """校验 .fpk：gzip 魔数 + tar 里必须含 manifest 且 appname=miproxy。"""
+    with open(path, "rb") as fh:
+        head = fh.read(2)
+    if head != b"\x1f\x8b":
+        raise KernelError("文件不是有效的 .fpk（gzip 压缩包）格式")
+    try:
+        with tarfile.open(path, "r:gz") as tar:
+            names = tar.getnames()
+            if "manifest" not in names:
+                raise KernelError(".fpk 里找不到 manifest，不是有效的 MiProxy 安装包")
+            fh = tar.extractfile("manifest")
+            if not fh:
+                raise KernelError("读取 manifest 失败")
+            manifest_text = fh.read(8192).decode("utf-8", "replace")
+    except (tarfile.TarError, OSError, EOFError) as exc:
+        raise KernelError(".fpk 解压/读取失败：%s" % exc)
+    if not re.search(r"^appname\s*=\s*miproxy", manifest_text, re.M):
+        raise KernelError("manifest 里的 appname 不是 miproxy，拒绝安装")
+    return manifest_text
+
+
+def _wizard_env_file(path):
+    """生成 appcenter-cli 可用的向导环境变量文件（沿用 settings.conf 现值）。"""
+    settings = read_settings()
+    lines = []
+    for key in ("wizard_sub_type", "wizard_sub_url", "wizard_sub_path",
+                "wizard_http_port", "wizard_api_port", "wizard_refresh_interval",
+                "wizard_tun_enable", "wizard_proxy_user", "wizard_proxy_pass",
+                "wizard_secret", "wizard_admin_port", "wizard_admin_token"):
+        value = settings.get(key, "")
+        if value:
+            lines.append('%s="%s"' % (key, value.replace('"', '\\"')))
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + ("\n" if lines else ""))
+
+
+def start_app_update(req):
+    """下载 + 校验 + 调 appcenter-cli 升级（后台线程）。"""
+    if app_task_running():
+        return 409, {"ok": False, "error": "已有应用更新任务正在进行"}
+    if _APPLY_LOCK.locked():
+        return 409, {"ok": False, "error": "正在应用配置变更，请稍候再更新应用"}
+    if kernel_task_running():
+        return 409, {"ok": False, "error": "内核任务正在进行，请稍候再更新应用"}
+
+    cli = find_appcenter_cli()
+    if not cli:
+        return 500, {"ok": False,
+                     "error": "未找到 fnOS 的 appcenter-cli，无法在线升级。"
+                              "请到 fnOS 应用中心 → MiProxy → 手动安装新版 .fpk（下载源可参考本页「下载源」）",
+                     "searched": ["PATH", "/usr/bin", "/usr/local/bin", "/opt/fnnas", "/bin"]}
+
+    tag = str(req.get("tag") or "").strip()
+    code, latest = check_app_updates()
+    payload = latest or {}
+    if not tag:
+        tag = str(((payload.get("latest") or {}).get("tag")) or "").strip()
+    if tag:
+        tag = tag.lstrip("v")
+    if not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}$", tag):
+        return 400, {"ok": False, "error": "还没拿到可用的版本号，请先点「检查更新」"}
+    target = next((r for r in (payload.get("releases") or [])
+                   if r["tag"].lstrip("v") == tag and r["url"]), None)
+    if target is None:
+        # 检查失败 / 离线重试用：按资产命名规则直接拼下载 URL
+        machine, asset_arch = _app_machine_arch()
+        name = "miproxy-%s-%s.fpk" % (tag, asset_arch)
+        base_url = APP_DL_BASE + "/" + "v" + tag + "/" + name
+        mirror = (read_kernel_state() or {}).get("mirror") or ""
+        target = {"tag": "v" + tag, "asset": name,
+                  "url": _apply_mirror(base_url, mirror) if mirror and base_url.startswith("https://github.com") else base_url,
+                  "size": 0, "arch": asset_arch}
+    tag = target["tag"].lstrip("v")
+
+    task_id = uuid.uuid4().hex[:12]
+    with APP_UPDATE_TASK_LOCK:
+        APP_UPDATE_TASK.update({
+            "state": "running", "phase": "下载", "percent": 5,
+            "message": "准备下载 %s" % (target.get("asset") or tag),
+            "error": "", "started_at": int(time.time()), "finished_at": 0,
+            "result": {"task_id": task_id, "tag": tag}, "log": [],
+        })
+    _save_appupdate_state(
+        state="running", phase="下载", percent=5,
+        message="准备下载 %s" % (target.get("asset") or tag),
+        started_at=int(time.time()), finished_at=0,
+        result={"task_id": task_id, "tag": tag, "cli": cli},
+        log=["开始应用自更新（%s → %s）" % (_app_current_version() or "?", tag)],
+    )
+    threading.Thread(
+        target=_app_update_worker, args=(task_id, tag, target, cli),
+        name="app-update", daemon=True).start()
+    return 202, {"ok": True, "task_id": task_id, "task": app_task_snapshot()}
+
+
+def _download_fpk(url, dest, mirror=""):
+    """下载到 dest。url 已含镜像前缀则直用；否则对 GitHub 官方域名套镜像前缀。"""
+    target_url = _apply_mirror(url, mirror) if url.startswith("https://github.com") else url
+    total = 0
+    try:
+        with _open_url(target_url, 30) as resp:
+            cl = to_int(resp.headers.get("Content-Length"), 0)
+            done = 0
+            with open(dest, "wb") as fh:
+                while True:
+                    chunk = resp.read(131072)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    done += len(chunk)
+                    total = done
+                    pct = 5 + (done / cl * 65 if cl else 0)
+                    _save_appupdate_state(percent=round(min(pct, 70), 1),
+                                          message="已下载 %.1f MB%s" % (
+                                              done / 1048576.0,
+                                              " / %.1f MB" % (cl / 1048576.0) if cl else ""))
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
+        raise KernelError("下载失败：%s（可填镜像前缀后重试）" % exc)
+    if total == 0:
+        raise KernelError("下载内容为空")
+    return total
+
+
+def _cli_capabilities(cli):
+    """探测 appcenter-cli 的子命令与参数（不同 fnOS 版本差异大），缓存结果。
+
+    返回 {"subcmd": "install-fpk"|"install-local"|"", "env":bool, "yes":bool,
+           "license":bool}。探测失败时给保守默认（install-fpk + 不带参数），
+    真正执行阶段还会按返回码/报错自适应重试。
+    """
+    global _cli_arg_cache
+    if _cli_arg_cache is not None:
+        return _cli_arg_cache
+    cap = {"subcmd": "", "env": False, "yes": False, "license": False}
+    top_help = ""
+    try:
+        proc = subprocess.run([cli, "--help"], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=20)
+        top_help = ((proc.stdout or "") + "\n" + (proc.stderr or "")).lower()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    # 子命令：新版多为 install-fpk；个别版本用 install-local / install
+    if "install-fpk" in top_help or "install-fpk" in top_help.replace("-", " "):
+        cap["subcmd"] = "install-fpk"
+    elif "install-local" in top_help:
+        cap["subcmd"] = "install-local"
+    elif "install" in top_help:
+        cap["subcmd"] = "install"
+    else:
+        cap["subcmd"] = "install-fpk"   # 保守默认
+    # 子命令级 help 里找 flags
+    sub_help = ""
+    try:
+        proc = subprocess.run([cli, cap["subcmd"], "--help"], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", timeout=20)
+        sub_help = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    cap["env"] = "--env" in sub_help
+    cap["yes"] = ("--yes" in sub_help) or ("-y " in sub_help) or (" -y" in sub_help)
+    cap["license"] = "--accept-license" in sub_help
+    _cli_arg_cache = cap
+    return cap
+
+
+_cli_arg_cache = None
+
+
+def _app_update_worker(task_id, tag, target, cli):
+    state = read_kernel_state()
+    work_dir = os.path.join(VAR_DIR, "appupdate")
+    fpk_path = os.path.join(work_dir, "miproxy-%s-%s.fpk" % (tag.lstrip("v"), target.get("arch") or "fpk"))
+    env_file = os.path.join(work_dir, "config.env")
+    install_log = os.path.join(work_dir, "install.log")
+    try:
+        os.makedirs(work_dir, exist_ok=True)
+        _task_log_update("开始下载 %s" % (target.get("asset") or tag))
+        size = _download_fpk(target["url"], fpk_path, state.get("mirror") or "")
+        _save_appupdate_state(phase="校验", percent=72, message="校验安装包完整性")
+        _verify_fpk(fpk_path)
+        _task_log_update("下载完成（%.1f MB），校验通过" % (size / 1048576.0))
+        _wizard_env_file(env_file)
+        _save_appupdate_state(phase="升级", percent=80, message="调用 appcenter-cli 安装（服务将重启）")
+
+        # 参数自适应：fnOS 各版本的 appcenter-cli 子命令与 flags 都不一样，
+        # 先探测能力，再按「最完整 → 最简」顺序试，命中即停。
+        caps = _cli_capabilities(cli)
+        subcmd = caps.get("subcmd") or "install-fpk"
+        _task_log_update("调用 appcenter-cli %s" % subcmd)
+
+        flags_full = []
+        if caps["env"]:
+            flags_full += ["--env", env_file]
+        if caps["license"]:
+            flags_full.append("--accept-license")
+        if caps["yes"]:
+            flags_full.append("--yes")
+        base = [cli, subcmd, fpk_path]
+        arg_sets = []
+        for candidate in ([base + flags_full, base] if flags_full else [base]):
+            if candidate not in arg_sets:
+                arg_sets.append(candidate)
+
+        last_rc, last_tail = 1, ""
+        for attempt, args in enumerate(arg_sets):
+            _task_log_update("第 %d 次尝试: %s" % (attempt + 1, " ".join(args)))
+            with open(install_log, "ab") as outlog:
+                proc = subprocess.Popen(
+                    args, stdout=outlog, stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL, start_new_session=True,
+                    env=dict(os.environ, MIPROXY_APPUPDATE_TASK=task_id),
+                )
+            try:
+                rc = proc.wait(timeout=600)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                raise KernelError("appcenter-cli 安装超时（>600s），请手动检查应用中心")
+            tail = ""
+            try:
+                with open(install_log, "rb") as fh:
+                    tail = fh.read()[-1500:].decode("utf-8", "replace")
+            except OSError:
+                pass
+            last_rc, last_tail = rc, tail
+            if rc == 0:
+                break
+            # 仅当失败信息指向「未知参数/子命令」时才换一组参数再试；
+            # 其它失败（网络、权限等）直接判败，避免无意义重试。
+            tl = tail.lower()
+            looks_like_usage = any(k in tl for k in (
+                "unknown", "unrecognized", "invalid option", "unexpected",
+                "invalid choice", "no such", "unrecognized option",
+                "argument", "usage:"))
+            if looks_like_usage and attempt + 1 < len(arg_sets):
+                continue
+            break
+
+        if last_rc == 0:
+            # 极少走到（通常升级过程中本服务已被 fnOS 停掉，由新进程的
+            # _adopt_appupdate_on_boot 补记成功）；走到这里直接确认完成。
+            _save_appupdate_state(state="done", phase="完成", percent=100,
+                                 message="已升级到 v%s（服务已重启）" % tag, finished_at=int(time.time()),
+                                 result={"task_id": task_id, "tag": tag, "returncode": 0})
+            with APP_UPDATE_TASK_LOCK:
+                APP_UPDATE_TASK.update(state="done", phase="完成", percent=100,
+                                       message="已升级到 v%s" % tag, finished_at=int(time.time()),
+                                       result=dict(APP_UPDATE_TASK.get("result") or {}, tag=tag, returncode=0))
+            _task_log_update("升级成功")
+            try:
+                os.remove(fpk_path)
+            except OSError:
+                pass
+        else:
+            _task_log_update("安装失败（rc=%s），安装包保留在 %s" % (last_rc, fpk_path))
+            raise KernelError(
+                "appcenter-cli 安装失败（返回码 %d）。旧版本已保留；"
+                "新安装包已存到 %s，可到 fnOS 应用中心 → 手动安装 用它完成升级。输出尾部：%s"
+                % (last_rc, fpk_path, (last_tail.strip()[-500:]) or "（无输出）"))
+    except KernelError as exc:
+        msg = str(exc)
+        _save_appupdate_state(state="error", phase="失败", error=msg,
+                              message=msg, finished_at=int(time.time()))
+        with APP_UPDATE_TASK_LOCK:
+            APP_UPDATE_TASK.update(state="error", phase="失败", error=msg, message=msg,
+                                   finished_at=int(time.time()))
+        _task_log_update("失败：%s" % msg)
+    except Exception as exc:  # noqa: BLE001
+        msg = "内部错误：%r" % exc
+        _save_appupdate_state(state="error", phase="失败", error=msg, message=msg,
+                              finished_at=int(time.time()))
+        with APP_UPDATE_TASK_LOCK:
+            APP_UPDATE_TASK.update(state="error", phase="失败", error=msg, message=msg,
+                                   finished_at=int(time.time()))
+        _task_log_update(msg)
+
+
+def _adopt_appupdate_on_boot():
+    """启动时接管上一轮任务：fnOS 升级成功后本进程是**新**的（旧进程已被
+    upgrade_init 停掉），内存态是 idle，但磁盘文件还停在 running。
+    若 manifest 版本已前进，说明升级成功，补记 done；否则保留现场并报错。
+    必须在 main() 里调用一次，且要等 TRIM_* 环境变量就绪。"""
+    state = appupdate_state()
+    if not state or state.get("state") != "running":
+        return
+    try:
+        if state.get("started_at") and time.time() - to_int(state.get("started_at"), 0) > 3600:
+            # 超过 1 小时的 running 标记视为残留（进程被强杀等），按失败收尾
+            raise KernelError("上一轮升级任务已中断（标记超过 1 小时），请手动检查 appcenter-cli 与日志")
+        cur = _app_current_version()
+        tag = str(state.get("result", {}).get("tag") or "").lstrip("v")
+        if tag and cur.lstrip("v") == tag:
+            _save_appupdate_state(state="done", phase="完成", percent=100,
+                                 message="已升级到 v%s（服务重启后确认成功）" % tag,
+                                 finished_at=int(time.time()))
+        elif tag and cur.lstrip("v") != tag:
+            # 版本没前进：升级可能失败但服务仍起来了（fnOS 回滚旧版）
+            _save_appupdate_state(state="error", phase="失败",
+                                  error="升级未完成（当前仍为 v%s），旧版本保留",
+                                  message="升级未完成，旧版本保留", finished_at=int(time.time()))
+    except KernelError as exc:
+        _save_appupdate_state(state="error", phase="失败", error=str(exc),
+                              message=str(exc), finished_at=int(time.time()))
+
+
 # ---------------------------------------------------------------- 状态汇总
 
 def build_status():
@@ -1908,6 +2419,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/apply/progress":
             return self._json(200, apply_progress_snapshot())
 
+        if path in ("/api/appupdate", "/api/appupdate/task"):
+            snap = app_task_snapshot()
+            snap["current"] = _app_current_version()
+            snap["repo"] = APP_REPO
+            snap["has_cli"] = bool(find_appcenter_cli())
+            return self._json(200, snap)
+
+        if path == "/api/appupdate/check":
+            code, data = check_app_updates()
+            return self._json(code, data)
+
         if path == "/api/logs":
             query = parse_qs(parsed.query)
             name = (query.get("name", ["info"])[0] or "info").strip()
@@ -1984,6 +2506,20 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/refresh":
             code, resp = do_refresh()
+            return self._json(code, resp)
+
+        if parsed.path in ("/api/appupdate/start", "/api/appupdate/install"):
+            data = {}
+            length = to_int(self.headers.get("Content-Length", 0), 0)
+            if length > 0:
+                if length > MAX_BODY:
+                    return self._json(400, {"error": "请求体过大"})
+                try:
+                    body = json.loads(self.rfile.read(length).decode("utf-8"))
+                    data = body if isinstance(body, dict) else {}
+                except Exception as exc:  # noqa: BLE001
+                    return self._json(400, {"error": "JSON 解析失败: %s" % exc})
+            code, resp = start_app_update(data)
             return self._json(code, resp)
 
         if parsed.path in ("/api/kernel/check", "/api/kernel/install",
@@ -2157,6 +2693,13 @@ def main():
     os.makedirs(VAR_DIR, exist_ok=True)
     with open(PID_FILE, "w", encoding="utf-8") as fh:
         fh.write(str(os.getpid()))
+
+    # 接管上一轮「应用自更新」任务（fnOS 升级成功后本进程是新的，内存态是
+    # idle，磁盘文件里还停在 running——按 manifest 版本是否前进补记结果）
+    try:
+        _adopt_appupdate_on_boot()
+    except Exception:  # noqa: BLE001 - 接管失败不影响服务启动
+        pass
 
     # 启动即轮转一次 + 常驻兜底线程：日志大小永远有界
     try:

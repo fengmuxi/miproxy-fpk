@@ -229,6 +229,7 @@
       <a class="tab" href="#/proxy" data-view="proxy">代理与面板</a>
       <a class="tab" href="#/nodes" data-view="nodes">节点</a>
       <a class="tab" href="#/kernel" data-view="kernel">内核</a>
+      <a class="tab" href="#/appupdate" data-view="appupdate">更新</a>
       <a class="tab" href="#/logs" data-view="logs">日志</a>
     </nav>
   </div>
@@ -486,6 +487,49 @@
     <div class="k-ver-row">
       <input type="text" id="kMirror" placeholder="https://ghfast.top/" style="max-width:420px">
       <button class="btn ghost" id="kMirrorBtn" type="button">保存镜像</button>
+    </div>
+  </div>
+
+  </section>
+
+  <!-- ==================== 应用自更新 ==================== -->
+  <section class="view" id="view-appupdate">
+
+  <div class="card">
+    <h2>应用本体（.fpk） <span class="tag" id="aCurTag">—</span></h2>
+    <div class="hint">检查 MiProxy 在 GitHub 上的最新 Release，一键下载并升级整个应用（比手动下 .fpk 再传应用中心快一步）。</div>
+    <div class="kgrid">
+      <div class="k-item"><span class="k-label">当前版本</span><div class="k-val" id="aCurVer">—</div></div>
+      <div class="k-item"><span class="k-label">设备架构</span><div class="k-val" id="aArch">—</div></div>
+      <div class="k-item"><span class="k-label">最新 Release</span><div class="k-val" id="aLatest">—</div></div>
+      <div class="k-item"><span class="k-label">安装通道</span><div class="k-val" id="aChannel">—</div></div>
+    </div>
+    <div class="actions">
+      <button class="btn primary" id="aCheckBtn" type="button">检查更新</button>
+      <button class="btn ghost" id="aUpgradeBtn" type="button" disabled>升级到最新</button>
+      <button class="btn ghost" id="aTaskShowLog" type="button" style="display:none">显示/隐藏明细</button>
+      <span class="muted" id="aLatestHint">尚未检查</span>
+    </div>
+    <div class="err-list" id="aErr"></div>
+  </div>
+
+  <div class="card" id="aTaskCard" style="display:none">
+    <h2>升级进度 <span class="tag" id="aTaskState">—</span></h2>
+    <div class="kbar"><span class="kbar-fill" id="aBar"></span></div>
+    <div class="muted" id="aTaskText">—</div>
+    <div class="actions" style="margin-top:10px">
+      <span class="muted" id="aTaskPct">0%</span>
+    </div>
+    <pre class="k-log" id="aTaskLog" style="display:none"></pre>
+  </div>
+
+  <div class="card">
+    <h2>行为说明</h2>
+    <div class="hint" style="margin-bottom:0">
+      升级走 fnOS 官方通道：<code>appcenter-cli install-fpk</code>，与「应用中心手动安装」完全等价——
+      数据目录、settings.conf、订阅配置全部保留，升级前先跑「备份 / 校验」；失败不会破坏旧版本。
+      <b>点「升级到最新」后应用会重启一次</b>（页面可能闪断，属正常），重新打开本页即可看到新版本。
+      下载慢或失败时，可在「内核」页填镜像前缀后重试。
     </div>
   </div>
 
@@ -1394,6 +1438,130 @@
     });
   }
 
+  // ---------------------------------------------------------------- 应用自更新（.fpk）
+  var appState = { poll: null };
+
+  // 版本号归一：去掉 leading "v"，让 manifest 的 "2.8.9" 与 tag 的 "v2.8.9" 可比
+  function normVer(s) { s = String(s == null ? "" : s).trim(); return s.charAt(0) === "v" ? s.slice(1) : s; }
+
+  function fmtAppTaskState(s) {
+    return ({ idle: "空闲", running: "进行中", done: "已完成", error: "失败" })[s] || s || "—";
+  }
+
+  function renderAppTask(t) {
+    var card = $("aTaskCard");
+    if (!t || t.state === "idle") { card.style.display = "none"; return; }
+    card.style.display = "";
+    var pct = Math.max(0, Math.min(100, t.percent || 0));
+    $("aBar").style.width = pct + "%";
+    $("aBar").className = "kbar-fill" + (t.state === "error" ? " err" : (t.state === "done" ? " ok" : ""));
+    $("aTaskPct").textContent = Math.round(pct) + "%";
+    $("aTaskState").textContent = fmtAppTaskState(t.state);
+    var detail = t.error || t.message || "";
+    $("aTaskText").textContent = detail || "—";
+    $("aTaskLog").textContent = (t.log || []).join("\n");
+    if (t.state !== "running") {
+      $("aTaskShowLog").style.display = "";
+    }
+  }
+
+  function stopAppPoll() {
+    if (appState.poll) { clearInterval(appState.poll); appState.poll = null; }
+  }
+
+  function pollAppTask() {
+    stopAppPoll();
+    var fails = 0;
+    appState.poll = setInterval(function () {
+      api("/api/appupdate/task").then(function (t) {
+        fails = 0;
+        renderAppTask(t);
+        if (t.state === "running") return;
+        stopAppPoll();
+        loadAppUpdate();
+        if (t.state === "done") {
+          toast("应用已更新到 " + ((t.result && t.result.tag) || "新版"), "ok");
+          setTimeout(function () { location.reload(); }, 800);
+        } else if (t.state === "error") {
+          toast("应用更新失败：" + (t.error || "未知错误"), "err");
+        }
+      }).catch(function () {
+        // 升级中 fnOS 会重启整个应用，本连接会断——不能因此停轮询：
+        // 应用重新起来后同一标签页继续轮询，读磁盘里补记的最终状态。
+        fails++;
+        if (fails >= 40) {  // 约 60s 仍连不上才放弃
+          stopAppPoll();
+          toast("应用正在升级重启，请稍后重新打开本页查看结果", "ok");
+        }
+      });
+    }, 1500);
+  }
+
+  function loadAppUpdate() {
+    return api("/api/appupdate").then(function (snap) {
+      $("aCurVer").textContent = (snap.current || "—") ? "v" + snap.current : "—";
+      $("aCurTag").textContent = snap.current ? "v" + snap.current : "未知";
+      $("aChannel").textContent = snap.has_cli ? "appcenter-cli" : "不可用";
+      // 任务进行中/有结果就显示进度卡
+      renderAppTask(snap);
+      if (snap.state === "error") $("aErr").innerHTML = "<li>" + esc(snap.error || "上一轮升级失败") + "</li>";
+      else $("aErr").innerHTML = "";
+      if (snap.state === "running") pollAppTask();
+      return api("/api/appupdate/check").then(function (r) {
+        if (r.arch) $("aArch").textContent = r.arch.machine + " → " + r.arch.asset;
+        var latest = r.latest || null;
+        if (latest && latest.tag) {
+          $("aLatest").textContent = latest.tag + (latest.size ? " · " + fmtSize(latest.size) : "");
+          var updatable = normVer(latest.tag) !== normVer(snap.current);
+          $("aLatestHint").textContent = snap.has_cli === false
+            ? "未找到 appcenter-cli，无法在线升级（请用应用中心手动安装）"
+            : (updatable ? "可升级到 " + latest.tag : "已是最新");
+          $("aUpgradeBtn").disabled = !updatable || snap.has_cli === false;
+        } else if (r.error) {
+          $("aLatest").textContent = "获取失败";
+          $("aLatestHint").textContent = r.error + (r.hint ? "：" + r.hint : "");
+          $("aUpgradeBtn").disabled = true;
+        }
+      });
+    }).catch(function (e) {
+      toast("读取应用更新信息失败：" + e.message, "err");
+    });
+  }
+
+  function checkAppUpdate() {
+    var btn = $("aCheckBtn");
+    btn.disabled = true; btn.textContent = "检查中…";
+    api("/api/appupdate/check").then(function (r) {
+      var latest = r.latest || null;
+      if (r.arch) $("aArch").textContent = r.arch.machine + " → " + r.arch.asset;
+      if (r.error && !latest) {
+        $("aLatestHint").textContent = r.error + (r.hint ? "：" + r.hint : "");
+        $("aLatest").textContent = "获取失败";
+      } else if (latest && latest.tag) {
+        $("aLatest").textContent = latest.tag + (latest.size ? " · " + fmtSize(latest.size) : "");
+        var updatable = normVer(latest.tag) !== normVer(r.current);
+        $("aLatestHint").textContent = updatable ? ("发现新版本 " + latest.tag + "，可一键升级") : "已是最新版本 " + latest.tag;
+        api("/api/appupdate/task").then(function (snap) {
+          $("aUpgradeBtn").disabled = !updatable || snap.has_cli === false;
+        }).catch(function () { $("aUpgradeBtn").disabled = !updatable; });
+      }
+    }).catch(function (e) {
+      $("aLatestHint").textContent = "检查失败：" + e.message;
+    }).finally(function () {
+      btn.disabled = false; btn.textContent = "检查更新";
+    });
+  }
+
+  function upgradeApp() {
+    if (!window.confirm("开始升级 MiProxy？\n\n升级过程会：\n1. 下载新版 .fpk 并校验\n2. 调用 fnOS 应用中心安装（应用重启一次，代理会短暂中断）\n3. 保留订阅与配置\n\n失败会自动保留旧版本。")) return;
+    api("/api/appupdate/start", { method: "POST", body: JSON.stringify({}) }).then(function (r) {
+      toast("开始升级，应用将在完成后重启", "ok");
+      pollAppTask();
+    }).catch(function (e) {
+      toast("启动升级失败：" + e.message, "err");
+    });
+  }
+
   // ---------------------------------------------------------------- 节点列表与测速
   var nodeState = { items: [], testing: false, kernelRunning: false, kernelNodes: null, configNodes: 0 };
 
@@ -1525,6 +1693,7 @@
     proxy: function () { loadSettings(); },
     nodes: function () { loadNodes(); },
     kernel: function () { loadKernel(); },
+    appupdate: function () { loadAppUpdate(); },
     logs: function () { loadLogs(); }
   };
   var _view = "overview";     // 当前视图（内存态）
@@ -1609,6 +1778,14 @@
         rollbackKernel(el.getAttribute("data-name"), el.getAttribute("data-ver"));
       }
     });
+
+    // 应用自更新
+    $("aCheckBtn").onclick = checkAppUpdate;
+    $("aUpgradeBtn").onclick = upgradeApp;
+    $("aTaskShowLog").onclick = function () {
+      var el = $("aTaskLog");
+      el.style.display = el.style.display === "none" ? "block" : "none";
+    };
 
     // 单一订阅生效：切换单选后立即提交并应用
     $("subList").addEventListener("change", function (ev) {

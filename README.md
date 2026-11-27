@@ -138,7 +138,7 @@
 除 Zashboard / MetaCubeXD 之外，MiProxy 自带一个**轻量管理页**，用于不开面板也能改配置：
 
 - 入口：面板选择页第三张卡片「MiProxy 管理」（走 9090 统一入口，局域网与 fn 链接远程均可），或局域网直连 `http://NAS_IP:9091/admin/`
-- **顶部菜单分页**：概览 / 订阅 / 代理与面板 / 节点 / 内核 / 日志，地址栏形如 `#/subscriptions`，可直接收藏某个页面、也能用浏览器前进后退
+- **顶部菜单分页**：概览 / 订阅 / 代理与面板 / 节点 / 内核 / 更新 / 日志，地址栏形如 `#/subscriptions`，可直接收藏某个页面、也能用浏览器前进后退
 - 能力：
 
 | 模块 | 说明 |
@@ -149,6 +149,7 @@
 | 代理与面板 | 代理端口、面板端口、代理用户名/密码、面板密钥、TUN 开关 |
 | 节点 | 列出 `config.yaml` 里**实际生效**的节点（名称 / 类型 / 地址 / 延迟），支持搜索、只看可用、单个或全部测速 |
 | 内核 | 检查 mihomo 官方最新版本、一键升级、按版本切换、恢复安装包内置内核、备份回滚、下载镜像前缀 |
+| 更新 | **应用本体（.fpk）在线自更新**：检查 GitHub 最新 Release、一键下载本机架构 `.fpk` 并走 fnOS 官方通道（`appcenter-cli`）升级整个应用，无需再手动下载上传应用中心 |
 | 日志 | 在线查看 `info.log` / `refresh_sub.log` / `install_callback.log` / `config_callback.log` / `upgrade_callback.log` / `admin.log`，支持 3 秒自动刷新（仅在该页生效） |
 
 节点页的行为约定：
@@ -168,6 +169,14 @@
 - 升级应用包（`.fpk`）**不会覆盖**你手动切换过的内核：内置内核另存为 `mihomo.bundled`，需要时点「恢复内置内核」；
 - 国内访问 GitHub 慢时，在「下载源」填镜像前缀（如 `https://ghfast.top/`，拼成 `镜像 + 原始地址`）；也可直接把内核文件放到 NAS 上，用「从文件安装」；
 - 下载地址只从官方 Releases 或你填的镜像推导，不接受任意 URL——避免把管理接口变成「下载任意可执行文件」的通道。
+
+应用自更新（「更新」页）的行为约定：
+
+- 「检查更新」拉取 MiProxy 在 GitHub 的最新 Release，按本机架构（x86_64 / arm64）挑 `miproxy-<版本>-<架构>.fpk`；版本源写死在代码里（可 `MIPROXY_APP_REPO` 覆盖），不信任前端传参。
+- 「升级到最新」流程：**下载 .fpk 到数据目录 → 校验（gzip/tar 魔数 + 解包读 manifest 的 `appname=miproxy`）→ 调 fnOS 自带 `appcenter-cli install-fpk` 走标准升级通道（与「应用中心手动安装」等价）**，数据目录、`settings.conf`、订阅配置全部保留；失败不破坏旧版，并把下载的 `.fpk` 留在数据目录 `appupdate/` 供手动安装。
+- 升级会重启整个应用（`appcenter-cli` 先跑 `upgrade_init` 停服务、装完 `upgrade_callback` 重启），代理会短暂中断，页面可能闪断属正常；完成后页面自动刷新。
+- **面板自带的「更新核心 / 更新面板」按钮**（Zashboard / MetaCubeXD 里）走的是 mihomo 内核的 `/upgrade`、`/upgrade/ui`，已被 9090 网关拦截并提示改用本通道或应用中心升级——避免内核默认面板包覆盖 MiProxy 自带 UI。
+- 内核版本（mihomo）仍走「内核」页独立管理，与应用本体（.fpk）互相独立。
 
 行为约定：
 
@@ -648,6 +657,11 @@ changes ──┬─→ build-x86 ──┐
 ---
 
 ## 更新日志
+
+### v2.8.10
+- ✨ 新增：**应用本体在线自更新（管理界面「更新」页）**。过去每次发版都要手动从 GitHub 下载 `.fpk` 再上传应用中心安装；现在可在管理页直接「检查更新 → 一键升级」：拉取 MiProxy 在 GitHub 的最新 Release，按本机架构（x86_64 / arm64）下载对应 `.fpk` 到 NAS 数据目录，校验后调 fnOS 自带的 `appcenter-cli install-fpk` 走**与「应用中心手动安装」完全等价**的标准升级通道（保留数据目录与 `settings.conf`、跑 `upgrade_init`/`upgrade_callback` 钩子）。全程页面轮询进度，升级会重启应用一次（代理短暂中断），完成后页面自动刷新
+- 🔒 安全与健壮：① 下载源写死在代码里（`MIPROXY_APP_REPO` 可覆盖），镜像前缀只对官方 GitHub 域名生效，不接受前端任意 URL；② 安装前 `_verify_fpk` 校验 gzip/tar 魔数 + 解包读 `manifest` 的 `appname=miproxy`，拒装来路不明的包；③ **失败保留旧版本**，并把下载的 `.fpk` 留在 `appupdate/` 目录供手动安装；④ 升级会停掉本服务、由 fnOS 重启——任务进度写 `appupdate.json` 文件而非内存，新进程启动时按 manifest 版本是否前进补记成功/失败（`_adopt_appupdate_on_boot`）
+- 🐛 修复：**网关拦截 mihomo 内核自升级端点（`POST /upgrade`、`POST /upgrade/ui`）**。此前 Zashboard 点「更新面板」会走内核的 `/upgrade/ui`，因 MiProxy 的 `config.yaml` 未设 `external-ui-url`，内核会用内置默认面板 zip（MetaCubeXD）覆盖 MiProxy 自带的 Zashboard/选择页文件，导致「Zashboard 消失、变成 MetaCubeXD」；`/upgrade` 还会绕过 MiProxy 的内核备份/回滚链路直接换内核。现在网关层拦掉这两个端点、返回说明文字，面板与内核升级统一走「更新」页与「内核」页
 
 ### v2.8.9
 - 🐛 修复（重要）：**应用运行久了莫名崩溃/被标停止**。排查结论：整个项目没有任何日志轮转机制，`info.log`（mihomo 内核 info 级别输出，TUN 全局代理下每个连接一条日志）与 `admin.log`（每个请求一行，管理页还有轮询）无限增长，磁盘写满后内核 cache.db 写入失败、各服务写日志失败 → 崩溃。修复：**双层日志安全阀**——① `main` 的 start/restart/restart-kernel 入口轮转一次；② 管理服务内置每小时兜底轮转线程（应用几个月不重启日志也有界）。策略：任何日志超 10MB 保留一份 `.1` 备份后清空原文件；用 truncate 而非 mv——长驻进程的日志 fd 是追加模式，清空后继续写落在文件新末尾，**无需重启任何进程**。同时数据卷剩余低于 500MB 时打节流水位预警。内核升级备份本就有上限（3 份），无需处理

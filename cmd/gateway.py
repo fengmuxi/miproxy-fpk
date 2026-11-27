@@ -26,6 +26,7 @@ keep-alive 陷阱与对策：
   WebSocket 请求（带 Upgrade 头）保持原样，连接专用、不受影响。
 """
 
+import json
 import os
 import select
 import socket
@@ -45,6 +46,27 @@ LOG_PATH = os.environ.get("GATEWAY_LOG", "")
 BUF_SIZE = 65536
 HEAD_MAX = 65536
 IDLE_TIMEOUT = 600  # 空闲连接保底超时（秒）：长连接泄漏时兜底回收
+
+# mihomo 内核自带的「在线自升级」端点，必须在网关这一层拦掉。
+#
+# 背景：Zashboard / MetaCubeXD 面板里的「更新核心 / 更新面板」按钮会调用
+# mihomo external-controller 的 POST /upgrade、POST /upgrade/ui（经 9090 网关
+# 转发到内部控制器端口）。但 MiProxy 的 config.yaml 没有设 external-ui-url，
+# 于是 /upgrade/ui 会拿内核内置的**默认面板（MetaCubeXD）**的 zip 去覆盖
+# ${VAR}/ui/ 下 MiProxy 自带的 Zashboard / 选择页文件——用户从 Zashboard 点
+# 「更新面板」后它做 window.location.reload()，面板就变成 MetaCubeXD（报障现象）。
+# /upgrade 则会绕过 MiProxy 的备份/回滚与 restart-kernel 直接换内核。
+#
+# MiProxy 的面板随 .fpk 分发、内核走管理界面「内核」页统一管理，所以在网关
+# 拦掉这两个内核自升级端点最稳：不改第三方面板文件（agent.md §9.31），面板里
+# 点「更新」只会得到一条说明，不会造成破坏。
+UPGRADE_BLOCK = {
+    "/upgrade/ui": "MiProxy 的面板由 .fpk 安装包统一管理，不支持在此在线替换"
+                  "（否则会覆盖成内核默认面板 MetaCubeXD）。请通过 fnOS 应用中心"
+                  "升级 MiProxy 获取新面板。",
+    "/upgrade": "MiProxy 的内核由管理界面「内核」页统一管理（自动备份、失败回滚），"
+                "请勿在此直接在线升级。",
+}
 
 
 def log(msg):
@@ -113,6 +135,31 @@ def pump(sock_a, sock_b):
                 return
 
 
+def first_request(head):
+    """解析首个 HTTP 请求行，返回 (method, path)。解析失败返回 (None, None)。"""
+    try:
+        line = head.split(b"\r\n", 1)[0].decode("latin-1")
+        parts = line.split(" ")
+        if len(parts) < 2:
+            return None, None
+        method, path = parts[0].upper(), parts[1]
+        # 去掉 query / 片段，只按路径判断
+        path = path.split("?", 1)[0].split("#", 1)[0]
+        return method, path
+    except Exception:
+        return None, None
+
+
+def is_blocked_upgrade(head):
+    """是否要拦掉的 mihomo 自升级请求（POST /upgrade 或 POST /upgrade/ui）。"""
+    method, path = first_request(head)
+    return method == "POST" and path in UPGRADE_BLOCK
+
+
+def blocked_upgrade_message(path):
+    return UPGRADE_BLOCK.get(path, UPGRADE_BLOCK["/upgrade"])
+
+
 def read_request_head(client):
     """读满请求头（到 \\r\\n\\r\\n 为止）。失败返回 None。"""
     client.settimeout(15)
@@ -130,11 +177,37 @@ def read_request_head(client):
     return None  # 超长异常请求，丢弃
 
 
+def reject_blocked_upgrade(client, path):
+    """对拦下的 mihomo 自升级请求回一个 400 JSON 说明，然后断开连接。
+
+    为什么返回 400 而不是 200：面板按钮拿到 200 会弹「成功」并整页
+    window.location.reload()——那时 UI 目录已经被覆盖，reload 出来就是
+    内核默认面板（MetaCubeXD）。400 走面板的 catch 分支只弹错误提示，
+    页面保持原样。
+    """
+    message = blocked_upgrade_message(path)
+    body = json.dumps({"ok": False, "error": message}, ensure_ascii=False).encode("utf-8")
+    log("拦截 mihomo 自升级请求: POST %s（面板与内核改由 .fpk / 管理界面「内核」页管理）" % path)
+    try:
+        client.sendall(
+            b"HTTP/1.1 400 Bad Request\r\n"
+            b"Content-Type: application/json; charset=utf-8\r\n"
+            b"Connection: close\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+        )
+    except OSError:
+        pass
+
+
 def handle(client):
     try:
         head = read_request_head(client)
         if not head:
             client.close()
+            return
+        # 在选后端/透传之前先拦 mihomo 自升级端点（见 UPGRADE_BLOCK 说明）
+        if is_blocked_upgrade(head):
+            reject_blocked_upgrade(client, first_request(head)[1])
             return
         host, port = pick_backend(head)
         payload = force_close(head)
