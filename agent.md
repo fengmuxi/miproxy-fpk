@@ -258,3 +258,5 @@ miproxy-fpk/
 - 不要提交真实订阅 URL、密钥、凭据到仓库。
 
 43. **应用自更新下载 .fpk 的三大坑（v2.8.12）**：① `github.com/.../releases/download/...` 会 302 到 `release-assets.githubusercontent.com`，国内链路经常连上后读超时（错误文本 `The read operation timed out` 就是 `socket.timeout`），而 api.github.com（检查更新）往往正常——所以「检查成功、下载失败」是常态不是 bug；② `urlopen(timeout=30)` 的 timeout 是**单次 socket 读**超时、不是整个下载超时，30s 偏短，已提到 60s；③ 必须多源回退 + Range 断点续传：`BUILTIN_FPK_MIRRORS` 内置 ghfast/gh-proxy，`_fpk_source_urls()` 按「用户镜像→内置→直连」生成候选，`_download_fpk()` 逐源尝试并用 `Range: bytes=N-` 续传。新增镜像域名要同步 `MIRROR_HOSTS`（含 release-assets）。`check_app_updates()` 失败时也要返回本地 arch，否则页面「设备架构」显示空。
+
+44. **应用更新失败状态的死锁（v2.8.13）**：`appupdate.json` 持久化任务态是为了跨升级时的服务重启（appcenter-cli install-fpk 会杀掉管理服务），但**必须有清除入口**——否则失败后进度卡永远显示，刷新也没用；而 check 失败时升级按钮禁用，用户连「开新任务覆盖旧状态」都做不到。现在 `dismiss_appupdate_state()` + `POST /api/appupdate/dismiss` + 前端「清除记录」按钮打破死锁。两个易错点：① `app_task_snapshot()` 会用磁盘文件覆盖内存态，所以 dismiss 后必须设 `APP_UPDATE_DISMISSED` 标记拦截磁盘读取（防删除失败时状态复活）；② 新任务开始时务必把该标记复位，否则跨重启读取能力会永久失效。

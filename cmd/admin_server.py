@@ -1795,6 +1795,7 @@ APP_UPDATE_TASK = {
     "started_at": 0, "finished_at": 0, "result": {}, "log": [],
 }
 APP_UPDATE_TASK_LOCK = threading.Lock()
+APP_UPDATE_DISMISSED = [False]   # 用户清过记录：忽略磁盘上的旧状态（防删除失败时复活）
 _app_cli_path = None
 
 
@@ -1813,6 +1814,9 @@ def app_task_snapshot():
         snap["result"] = dict(APP_UPDATE_TASK.get("result") or {})
     # 升级会杀掉本进程：新进程内存态是 idle，磁盘文件里才有上一轮的真实进度。
     # 谁更近用谁（按 started_at 比）。
+    # 用户点了「清除记录」后：即便磁盘文件因权限等原因没删掉，也不再拿它覆盖内存态
+    if APP_UPDATE_DISMISSED[0]:
+        return snap
     state = appupdate_state()
     if state and to_int(state.get("started_at"), 0) > to_int(snap.get("started_at"), 0):
         snap["state"] = state.get("state") or "idle"
@@ -1839,6 +1843,26 @@ def appupdate_state():
         return data if isinstance(data, dict) else None
     except (OSError, ValueError):
         return None
+
+
+def dismiss_appupdate_state():
+    """清除「上一次升级失败/成功」的持久化记录，让页面回到空闲态。
+
+    为什么会需要：任务状态写在 appupdate.json 里以跨越升级时的进程重启，
+    但没有任何过期/清除机制 —— 失败后页面会永远显示「失败 5%」，刷新也没用；
+    而检查更新失败时升级按钮又被禁用，用户连「开个新任务覆盖旧状态」都做不到，
+    形成死锁。这里给前端一个显式「清除记录」入口打破它。
+    """
+    APP_UPDATE_DISMISSED[0] = True
+    with APP_UPDATE_TASK_LOCK:
+        APP_UPDATE_TASK.update({
+            "state": "idle", "phase": "", "percent": 0, "message": "", "error": "",
+            "started_at": 0, "finished_at": 0, "result": {}, "log": [],
+        })
+    try:
+        os.remove(APPUPDATE_STATE_FILE)
+    except OSError:
+        pass
 
 
 def _save_appupdate_state(**kw):
@@ -2044,6 +2068,7 @@ def start_app_update(req):
     tag = target["tag"].lstrip("v")
 
     task_id = uuid.uuid4().hex[:12]
+    APP_UPDATE_DISMISSED[0] = False  # 新任务开始：重新允许从磁盘读取状态（跨进程重启用）
     with APP_UPDATE_TASK_LOCK:
         APP_UPDATE_TASK.update({
             "state": "running", "phase": "下载", "percent": 5,
@@ -2661,6 +2686,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if self._write_blocked():
             return
+
+        # 清除上一次升级失败/成功的持久化进度卡（不碰配置、不动内核）
+        if parsed.path == "/api/appupdate/dismiss":
+            dismiss_appupdate_state()
+            return self._json(200, {"ok": True, "task": app_task_snapshot()})
 
         if parsed.path == "/api/settings":
             length = to_int(self.headers.get("Content-Length", 0), 0)
