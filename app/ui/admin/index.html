@@ -1547,6 +1547,7 @@
       return api("/api/appupdate/check").then(function (r) {
         if (r.arch) $("aArch").textContent = r.arch.machine + " → " + r.arch.asset;
         var latest = r.latest || null;
+        appState.latest = latest;   // 供 upgradeApp 传精确资产名做架构二次校验
         if (latest && latest.tag) {
           $("aLatest").textContent = latest.tag + (latest.size ? " · " + fmtSize(latest.size) : "");
           var updatable = normVer(latest.tag) !== normVer(snap.current);
@@ -1570,6 +1571,7 @@
     btn.disabled = true; btn.textContent = "检查中…";
     api("/api/appupdate/check").then(function (r) {
       var latest = r.latest || null;
+      appState.latest = latest;   // 供 upgradeApp 传精确资产名做架构二次校验
       if (r.arch) $("aArch").textContent = r.arch.machine + " → " + r.arch.asset;
       if (r.error && !latest) {
         $("aLatestHint").textContent = r.error + (r.hint ? "：" + r.hint : "");
@@ -1591,7 +1593,15 @@
 
   function upgradeApp() {
     if (!window.confirm("开始升级 MiProxy？\n\n升级过程会：\n1. 下载新版 .fpk 并校验\n2. 调用 fnOS 应用中心安装（应用重启一次，代理会短暂中断）\n3. 保留订阅与配置\n\n失败会自动保留旧版本。")) return;
-    api("/api/appupdate/start", { method: "POST", body: JSON.stringify({}) }).then(function (r) {
+    // 把页面上显示的精确资产名传给后端做二次校验：
+    // GitHub API 的 assets 顺序是 arm64 在前，仅按版本号匹配会下错架构的包。
+    var payload = {};
+    var latest = appState.latest;
+    if (latest && latest.asset && latest.tag) {
+      payload.tag = latest.tag;
+      payload.asset = latest.asset;
+    }
+    api("/api/appupdate/start", { method: "POST", body: JSON.stringify(payload) }).then(function (r) {
       toast("开始升级，应用将在完成后重启", "ok");
       pollAppTask();
     }).catch(function (e) {

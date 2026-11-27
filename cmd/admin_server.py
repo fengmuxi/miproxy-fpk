@@ -2045,7 +2045,9 @@ def start_app_update(req):
                               "请到 fnOS 应用中心 → MiProxy → 手动安装新版 .fpk（下载源可参考本页「下载源」）",
                      "searched": ["PATH", "/usr/bin", "/usr/local/bin", "/opt/fnnas", "/bin"]}
 
+    machine, asset_arch = _app_machine_arch()
     tag = str(req.get("tag") or "").strip()
+    want_asset = str(req.get("asset") or "").strip()   # 前端传来的精确资产名（二次校验）
     code, latest = check_app_updates()
     payload = latest or {}
     if not tag:
@@ -2054,11 +2056,19 @@ def start_app_update(req):
         tag = tag.lstrip("v")
     if not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}$", tag):
         return 400, {"ok": False, "error": "还没拿到可用的版本号，请先点「检查更新」"}
-    target = next((r for r in (payload.get("releases") or [])
-                   if r["tag"].lstrip("v") == tag and r["url"]), None)
+    # ⚠️ 必须按架构过滤：GitHub API 返回的 assets 顺序是 arm64 在前，
+    # 只按 tag 匹配会永远拿到 arm64 —— x86 设备下载 arm64 包，安装必然失败。
+    # 这个 bug 曾导致「设备架构显示 x86_64，实际下载 arm64.fpk」。
+    candidates = [r for r in (payload.get("releases") or [])
+                  if r["tag"].lstrip("v") == tag and r["url"]
+                  and r.get("arch") == asset_arch]
+    target = None
+    if want_asset:
+        target = next((r for r in candidates if r["asset"] == want_asset), None)
+    if target is None:
+        target = next(iter(candidates), None)
     if target is None:
         # 检查失败 / 离线重试用：按资产命名规则直接拼下载 URL
-        machine, asset_arch = _app_machine_arch()
         name = "miproxy-%s-%s.fpk" % (tag, asset_arch)
         base_url = APP_DL_BASE + "/" + "v" + tag + "/" + name
         mirror = (read_kernel_state() or {}).get("mirror") or ""
@@ -2071,17 +2081,18 @@ def start_app_update(req):
     APP_UPDATE_DISMISSED[0] = False  # 新任务开始：重新允许从磁盘读取状态（跨进程重启用）
     with APP_UPDATE_TASK_LOCK:
         APP_UPDATE_TASK.update({
-            "state": "running", "phase": "下载", "percent": 5,
-            "message": "准备下载 %s" % (target.get("asset") or tag),
+            "state": "running", "phase": "下载", "percent": 1,
+            "message": "准备下载 %s（正在连接下载源，首个数据块可能较慢）" % (target.get("asset") or tag),
             "error": "", "started_at": int(time.time()), "finished_at": 0,
             "result": {"task_id": task_id, "tag": tag}, "log": [],
         })
     _save_appupdate_state(
-        state="running", phase="下载", percent=5,
-        message="准备下载 %s" % (target.get("asset") or tag),
+        state="running", phase="下载", percent=1,
+        message="准备下载 %s（正在连接下载源，首个数据块可能较慢）" % (target.get("asset") or tag),
         started_at=int(time.time()), finished_at=0,
-        result={"task_id": task_id, "tag": tag, "cli": cli},
-        log=["开始应用自更新（%s → %s）" % (_app_current_version() or "?", tag)],
+        result={"task_id": task_id, "tag": tag, "cli": cli, "asset": target.get("asset", "")},
+        log=["开始应用自更新（%s → %s，架构 %s）" % (
+            _app_current_version() or "?", tag, asset_arch)],
     )
     threading.Thread(
         target=_app_update_worker, args=(task_id, tag, target, cli),
@@ -2114,7 +2125,7 @@ def _fpk_source_urls(url, mirror):
     return out
 
 
-def _download_fpk(url, dest, mirror=""):
+def _download_fpk(url, dest, mirror="", expected_total=0):
     """下载 .fpk 到 dest：多镜像自动回退 + Range 断点续传 + 重试。
 
     国内从 GitHub 下载 37MB 资产时，github.com 会重定向到
@@ -2122,18 +2133,19 @@ def _download_fpk(url, dest, mirror=""):
     （The read operation timed out）或中途 RemoteDisconnected。原实现只有一个源、
     30s 超时、失败即报错，用户只能手填镜像——但页面此时架构/版本又显示为空，
     体验很差。现在自动在多个源之间切换并续传，全程只在最后仍失败时才报错。
+
+    expected_total：GitHub API 已知的资产大小（字节）。作为 total_size 的兜底——
+    某些镜像用 chunked 传输不回 Content-Length，若第一轮又中断，续传前
+    total_size 会一直是 0，进度条就永远停在 5%。有响应头时以响应头为准。
     """
     sources = _fpk_source_urls(url, mirror)
     done = 0                       # 已在 dest 里落盘的字节数
-    total_size = 0
+    total_size = max(0, int(expected_total or 0))
     last_err = ""
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
 
     for round_no in range(_FPK_MAX_ROUNDS):
         src = sources[round_no % len(sources)]
-        if round_no >= len(sources) and done > 0:
-            # 所有源都试过一轮且已有部分数据：再从第一个源续传一轮
-            pass
         headers = {"User-Agent": "MiProxyAdmin/1.0 (+fnOS)",
                    "Accept": "application/octet-stream, */*"}
         if done > 0:
@@ -2146,7 +2158,13 @@ def _download_fpk(url, dest, mirror=""):
                 if done > 0 and status == 200 and not resp.headers.get("Content-Range"):
                     # 源不支持续传，从头重写
                     done = 0
-                if cl and not resp.headers.get("Content-Range"):
+                crange = resp.headers.get("Content-Range") or ""
+                if crange:
+                    # 206 续传：Content-Range: bytes start-end/total —— total 是权威值
+                    m = re.search(r"/(\d+)\s*$", crange)
+                    if m:
+                        total_size = int(m.group(1))
+                elif cl:
                     total_size = done + cl
                 mode = "ab" if done > 0 else "wb"
                 with open(dest, mode) as fh:
@@ -2161,7 +2179,7 @@ def _download_fpk(url, dest, mirror=""):
                         fh.write(chunk)
                         fh.flush()
                         done += len(chunk)
-                        pct = 5 + (done / total_size * 65 if total_size else 0)
+                        pct = 1 + (done / total_size * 69 if total_size else 0)
                         _save_appupdate_state(
                             percent=round(min(pct, 70), 1),
                             message="已下载 %.1f MB%s（源 %d/%d）" % (
@@ -2172,6 +2190,7 @@ def _download_fpk(url, dest, mirror=""):
                     _task_log_update("下载完成（%.1f MB）" % (done / 1048576.0))
                     return done
                 if done > 0 and not total_size:
+
                     # 无 Content-Length（某些镜像）：读到大块数据且正常结束即视为完成
                     _task_log_update("下载完成（%.1f MB，源未返回总长度）" % (done / 1048576.0))
                     return done
@@ -2243,7 +2262,8 @@ def _app_update_worker(task_id, tag, target, cli):
     try:
         os.makedirs(work_dir, exist_ok=True)
         _task_log_update("开始下载 %s" % (target.get("asset") or tag))
-        size = _download_fpk(target["url"], fpk_path, state.get("mirror") or "")
+        size = _download_fpk(target["url"], fpk_path, state.get("mirror") or "",
+                             expected_total=to_int(target.get("size"), 0))
         _save_appupdate_state(phase="校验", percent=72, message="校验安装包完整性")
         _verify_fpk(fpk_path)
         _task_log_update("下载完成（%.1f MB），校验通过" % (size / 1048576.0))
